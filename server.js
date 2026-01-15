@@ -12,7 +12,8 @@ app.use(cors({
 
 // --- CONFIGURATION ---
 const PROJECT_ID = "groovy-root-483105-n9"; 
-const DATA_STORE_ID = "claretycommunityai_1767529726880"; 
+// I switched this to your "ClaretyCoreAI" ID which has the data:
+const APP_ID = "claretycoreai_1767340856472"; 
 const LOCATION = "global"; 
 // ---------------------
 
@@ -31,9 +32,10 @@ app.post("/chat", async (req, res) => {
 
         console.log("Searching for:", userQuery);
 
-        // --- THE FIX IS HERE ---
-        // We changed 'dataStores' to 'engines' because you are using a Search App.
-        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/engines/${DATA_STORE_ID}/servingConfigs/default_search`;
+        // --- THE FIX ---
+        // 1. We use 'engines' (because it's a Search App).
+        // 2. We use the APP_ID (ClaretyCoreAI) we defined above.
+        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/engines/${APP_ID}/servingConfigs/default_search`;
 
         const request = {
             servingConfig: servingConfig,

@@ -15,17 +15,15 @@ const APP_ID = "claretycoreai_1767340856472";
 const LOCATION = "global"; 
 // ---------------------
 
-// --- HELPER: UNWRAP GOOGLE DATA ---
-// This function digs through the messy "fields" and "stringValue" layers
-// to find the actual text, no matter how Google sends it.
+// --- HELPER: DATA CLEANER (The "Unwrapper") ---
+// Google sends data wrapped in weird objects. This fixes it.
 function unwrap(value) {
     if (!value) return null;
     if (value.stringValue) return value.stringValue;
     if (value.structValue) return unwrapStruct(value.structValue);
     if (value.listValue) return value.listValue.values.map(unwrap);
-    return value; // Return as-is if it's already simple
+    return value; 
 }
-
 function unwrapStruct(struct) {
     if (!struct || !struct.fields) return {};
     const result = {};
@@ -34,7 +32,7 @@ function unwrapStruct(struct) {
     }
     return result;
 }
-// ----------------------------------
+// ----------------------------------------------
 
 app.get("/", (req, res) => {
     res.send("Backend is running!");
@@ -45,15 +43,17 @@ app.post("/chat", async (req, res) => {
         const userQuery = req.body.query;
         console.log("User asked:", userQuery);
 
-        // --- 1. GREETINGS ---
-        const greetings = ["hi", "hello", "hey", "greetings", "good morning", "good afternoon"];
-        const cleanQuery = userQuery.toLowerCase().trim().replace(/[!.,?]/g, "");
-
-        if (greetings.includes(cleanQuery)) {
-            return res.json({ 
-                answer: "Hi there! I'm Clarety AI. I can answer questions about our community documents. How can I help you today?", 
-                links: [] 
-            });
+        // --- 1. PERSONALITY LAYER ---
+        const lowerQ = userQuery.toLowerCase();
+        
+        if (lowerQ.includes("how are you")) {
+            return res.json({ answer: "I'm functioning perfectly and ready to help! Thanks for asking.", links: [] });
+        }
+        if (lowerQ.includes("topics") || lowerQ.includes("what do you know")) {
+            return res.json({ answer: "I have access to the Clarety Knowledge Database. I can help with Contact Change Logs, Letter Exports, Campaign Pages, and Email Templates.", links: [] });
+        }
+        if (lowerQ.match(/^(hi|hello|hey|greetings)/)) {
+            return res.json({ answer: "Hello! Ask me anything about the Clarety community documents.", links: [] });
         }
 
         // --- 2. GOOGLE SEARCH ---
@@ -70,69 +70,56 @@ app.post("/chat", async (req, res) => {
             query: userQuery,
             pageSize: 5,
             contentSearchSpec: {
-                summarySpec: {
-                    summaryResultCount: 5,
-                    includeCitations: true,
-                    ignoreAdversarialQuery: true 
-                },
-                snippetSpec: {
-                    returnSnippet: true 
-                }
+                summarySpec: { summaryResultCount: 5, ignoreAdversarialQuery: true },
+                snippetSpec: { returnSnippet: true }
             }
         };
 
-        // We add { autoPaginate: false } to stop the logs from complaining
         const [response] = await client.search(request, { autoPaginate: false });
         
         // --- 3. SMART ANSWER LOGIC ---
-        let answer = "I checked my documents, but I couldn't find specific information about that. Could you try rephrasing your question?";
+        let answer = "I found some documents that might help, but I couldn't find a specific answer inside them. Please check the links below.";
         
-        // A. Check for AI Summary
+        // Strategy A: AI Summary
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         } 
-        // B. Fallback: Dig through results using the UNWRAPPER
+        // Strategy B: Search for ANY valid text snippet
         else if (response.results && response.results.length > 0) {
-             
-             let foundGoodSnippet = false;
+             let foundText = false;
 
              for (const result of response.results) {
-                 // Use our helper to clean the data!
+                 // CLEAN THE DATA
                  const data = unwrapStruct(result.document.derivedStructData);
                  
-                 // Now 'data' is clean! We can use data.snippets, data.title, etc.
-
-                 // Check Snippets
-                 if (data.snippets && Array.isArray(data.snippets) && data.snippets.length > 0) {
-                     let snippetText = data.snippets[0].snippet;
-                     
-                     // Filter out the "No snippet" junk
-                     if (snippetText && !snippetText.includes("No snippet is available")) {
-                         // Clean up HTML tags
-                         answer = "I found this in the documents: " + snippetText.replace(/<[^>]*>/g, "");
-                         foundGoodSnippet = true;
+                 // Look for snippets
+                 if (data.snippets && data.snippets.length > 0) {
+                     let text = data.snippets[0].snippet;
+                     if (text && !text.includes("No snippet is available")) {
+                         // Clean HTML tags
+                         answer = "Here is a relevant excerpt: " + text.replace(/<[^>]*>/g, "");
+                         foundText = true;
                          break;
                      }
                  }
              }
-
-             // Loop 2: If no text found, use the Title
-             if (!foundGoodSnippet) {
-                 // Unwrap the first document to get the title
+             
+             // Strategy C: If no text found, use the Title of the first doc
+             if (!foundText) {
                  const firstData = unwrapStruct(response.results[0].document.derivedStructData);
                  if (firstData.title) {
-                     answer = `I found a document named "${firstData.title}" that seems relevant. You can open it below to read more.`;
+                     answer = `I couldn't read the text preview, but I found a document named "${firstData.title}" that seems to answer your question.`;
                  }
              }
         }
 
-        // --- 4. LINKS ---
+        // --- 4. FORMAT LINKS ---
         const links = [];
         if (response.results) {
             response.results.forEach(result => {
                 const data = unwrapStruct(result.document.derivedStructData);
                 if (data.link) {
-                    links.push({ title: data.title || "Link", url: data.link });
+                    links.push({ title: data.title || "Document", url: data.link });
                 }
             });
         }
@@ -141,7 +128,7 @@ app.post("/chat", async (req, res) => {
 
     } catch (error) {
         console.error("Backend Error:", error);
-        res.status(500).json({ answer: "I'm having a little trouble connecting to my brain right now. Please try again in a moment.", error: error.message });
+        res.status(500).json({ answer: "I'm having a little trouble connecting. Please try again.", error: error.message });
     }
 });
 

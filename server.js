@@ -10,14 +10,17 @@ app.use(cors({
 }));
 
 // --- CONFIGURATION ---
-// Using the Project Number and Data Store ID that successfully found your image
 const PROJECT_NUMBER = "28062079972"; 
 const LOCATION = "global"; 
+
+// CHATGPT FIX: We are swapping 'default_collection' for your specific Collection ID
+const COLLECTION_ID = "claretycoreai_1767340742213"; 
+
+// THE DATA STORE ID (The specific folder with your files)
 const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
 // ---------------------
 
 // --- HELPER: DATA CLEANER ---
-// Cleans up Google's messy data structure
 function smartUnwrap(data) {
     if (!data) return null;
     if (data.fields) {
@@ -39,7 +42,6 @@ function unwrapValue(value) {
 }
 
 // --- HELPER: LINK FIXER ---
-// Converts "gs://" links to clickable "https://" links
 function fixLink(link) {
     if (!link) return "#";
     if (link.startsWith("gs://")) {
@@ -71,8 +73,11 @@ app.post("/chat", async (req, res) => {
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
         const client = new SearchServiceClient({ credentials });
 
-        // Connect to the Data Store (The Library Shelf)
-        const servingConfig = `projects/${PROJECT_NUMBER}/locations/${LOCATION}/collections/default_collection/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
+        // --- PATH CONSTRUCTION ---
+        // We use the specific COLLECTION_ID here as suggested
+        const servingConfig = `projects/${PROJECT_NUMBER}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
+
+        console.log("Connecting to:", servingConfig); // DEBUG PRINT
 
         const request = {
             servingConfig: servingConfig,
@@ -92,7 +97,7 @@ app.post("/chat", async (req, res) => {
         let answer = "";
         const links = [];
 
-        // Check for AI Summary first
+        // Check for AI Summary
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         }
@@ -118,7 +123,7 @@ app.post("/chat", async (req, res) => {
                      foundTitles.push(data.title);
                  }
 
-                 // Collect Snippet (if we don't have an AI summary yet)
+                 // Collect Snippet
                  if (!answer && !bestSnippet && data.snippets && data.snippets.length > 0) {
                      let text = data.snippets[0].snippet;
                      if (text && !text.includes("No snippet is available")) {
@@ -127,7 +132,7 @@ app.post("/chat", async (req, res) => {
                  }
              }
 
-             // Construct the final answer string
+             // Construct Answer
              if (!answer) {
                  if (bestSnippet) {
                      answer = `Here is what I found in the documents:\n"${bestSnippet}"`;

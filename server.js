@@ -5,17 +5,13 @@ const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
 const app = express();
 app.use(express.json());
 
-app.use(
-  cors({
-    origin: "*",
-  })
-);
+app.use(cors({ origin: "*" }));
 
 // ================= CONFIG =================
 const PROJECT_NUMBER = "28062079972";
 const LOCATION = "global";
 const COLLECTION_ID = "default_collection";
-const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store";
+const ENGINE_ID = "claretycoreai_1767340856472";
 // ==========================================
 
 function getCredentials() {
@@ -33,13 +29,10 @@ app.get("/", (req, res) => {
   res.send("Backend is running");
 });
 
-/**
- * STEP 2: Discovery Engine ONLY
- */
 app.post("/chat", async (req, res) => {
   console.log("=================================");
-  console.log("CHAT HIT");
-  console.log("Query:", req.body);
+  console.log("CHAT REQUEST");
+  console.log(req.body);
   console.log("=================================");
 
   try {
@@ -49,7 +42,13 @@ app.post("/chat", async (req, res) => {
       credentials: getCredentials(),
     });
 
-    const servingConfig = `projects/${PROJECT_NUMBER}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
+    // 🔑 THIS IS THE KEY CHANGE
+    const servingConfig = `
+projects/${PROJECT_NUMBER}/locations/${LOCATION}
+  /collections/${COLLECTION_ID}
+  /engines/${ENGINE_ID}
+  /servingConfigs/default_search
+`.replace(/\s+/g, "");
 
     console.log("Using servingConfig:", servingConfig);
 
@@ -62,20 +61,20 @@ app.post("/chat", async (req, res) => {
       { autoPaginate: false }
     );
 
-    console.log("Result count:", response.results?.length || 0);
+    console.log("Results:", response.results?.length || 0);
 
     const titles = [];
 
     if (response.results) {
       for (const r of response.results) {
-        const data = r.document?.derivedStructData;
-        if (data?.fields?.title?.stringValue) {
-          titles.push(data.fields.title.stringValue);
+        const fields = r.document?.derivedStructData?.fields;
+        if (fields?.title?.stringValue) {
+          titles.push(fields.title.stringValue);
         }
       }
     }
 
-    return res.json({
+    res.json({
       answer:
         titles.length > 0
           ? "Documents found:\n• " + titles.join("\n• ")
@@ -85,9 +84,9 @@ app.post("/chat", async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("SEARCH ERROR:", err);
-    return res.status(500).json({
-      answer: "Discovery Engine error",
+    console.error("ENGINE SEARCH ERROR:", err);
+    res.status(500).json({
+      answer: "Search failed",
       error: err.message,
     });
   }

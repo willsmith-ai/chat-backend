@@ -10,14 +10,9 @@ app.use(cors({
 }));
 
 // --- CONFIGURATION ---
-const PROJECT_NUMBER = "28062079972"; 
+const PROJECT_ID = "groovy-root-483105-n9"; 
 const LOCATION = "global"; 
-
-// 1. We revert to 'default_collection' because the logs PROVED this works.
-const COLLECTION_ID = "default_collection";
-
-// 2. We use the Data Store ID because we know it holds your files (it found the image!)
-const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
+const ENGINE_ID = "claretycoreai_1767340856472"; 
 // ---------------------
 
 // --- HELPER: DATA CLEANER ---
@@ -63,7 +58,7 @@ app.post("/chat", async (req, res) => {
         // 1. PERSONALITY LAYER
         const lowerQ = userQuery.toLowerCase();
         if (lowerQ.match(/^(hi|hello|hey|greetings)/)) {
-            return res.json({ answer: "Hello! I am connected to the Clarety Knowledge Database.", links: [] });
+            return res.json({ answer: "Hello! I am connected to the Clarety Knowledge Database. Ask me about Contact Change Logs, Letter Exports, or Templates.", links: [] });
         }
 
         // 2. CONNECT TO GOOGLE
@@ -73,10 +68,9 @@ app.post("/chat", async (req, res) => {
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
         const client = new SearchServiceClient({ credentials });
 
-        // --- PATH CONSTRUCTION ---
-        // We use the DATA STORE path with 'default_collection'
-        // This matches the ONLY log that has ever successfully returned a file.
-        const servingConfig = `projects/${PROJECT_NUMBER}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
+        // --- PATH CONSTRUCTION (The ChatGPT Fix) ---
+        // We talk strictly to the Engine. The Engine knows where the data is.
+        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/engines/${ENGINE_ID}/servingConfigs/default_search`;
 
         console.log("Connecting to:", servingConfig); 
 
@@ -86,6 +80,7 @@ app.post("/chat", async (req, res) => {
             pageSize: 5,
             contentSearchSpec: {
                 snippetSpec: { returnSnippet: true },
+                // We keep summarySpec because the Engine is smart enough to handle it
                 summarySpec: { summaryResultCount: 5, ignoreAdversarialQuery: true }
             }
         };
@@ -94,16 +89,16 @@ app.post("/chat", async (req, res) => {
         
         console.log(`Found ${response.results ? response.results.length : 0} results.`);
 
-        // 3. ROBUST ANSWER LOGIC (The Fix for "0 Results")
+        // 3. ANSWER LOGIC
         let answer = "";
         const links = [];
 
-        // Try to get AI Summary
+        // Check for AI Summary
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         }
 
-        // If no summary, look for ANY file (Title or Snippet)
+        // Process Results
         if (response.results && response.results.length > 0) {
              const foundTitles = [];
              let bestSnippet = "";
@@ -131,12 +126,11 @@ app.post("/chat", async (req, res) => {
                  }
              }
 
-             // Build the response
+             // Final Answer Construction
              if (!answer) {
                  if (bestSnippet) {
                      answer = `Here is what I found:\n"${bestSnippet}"`;
                  } else if (foundTitles.length > 0) {
-                     // THIS IS THE KEY FIX: Even if no snippet, show the titles!
                      answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
                  } else {
                      answer = "I found some relevant files. Please check the links below.";
@@ -145,16 +139,14 @@ app.post("/chat", async (req, res) => {
         } 
         
         if (!answer) {
-            answer = "I searched the database but couldn't find a direct match. Try searching for a specific filename like 'Contact Change Log'.";
+            answer = "I searched the database but couldn't find a direct match. Try searching for a specific filename.";
         }
 
         res.json({ answer, links });
 
     } catch (error) {
         console.error("Backend Error:", error);
-        // Clean up the error message for the frontend
-        const errorMsg = error.details || error.message;
-        res.status(500).json({ answer: "I'm having trouble connecting. Details in logs.", error: errorMsg });
+        res.status(500).json({ answer: "I'm having trouble connecting. Please try again.", error: error.message });
     }
 });
 

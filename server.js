@@ -10,10 +10,11 @@ app.use(cors({
 }));
 
 // --- CONFIGURATION ---
-const PROJECT_ID = "groovy-root-483105-n9"; 
-// THE FIX: We added "_gcs_store" to the end of this ID
-const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
+// We are using the PROJECT NUMBER from your logs (Safe Mode)
+const PROJECT_ID = "28062079972"; 
 const LOCATION = "global"; 
+// We are using the APP ID (The Brain)
+const APP_ID = "claretycoreai_1767340856472"; 
 // ---------------------
 
 // --- HELPER: DATA CLEANER ---
@@ -69,8 +70,8 @@ app.post("/chat", async (req, res) => {
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
         const client = new SearchServiceClient({ credentials });
 
-        // We use the Data Store path, which works best for raw file retrieval
-        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
+        // We use the ENGINES path (The Brain)
+        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/engines/${APP_ID}/servingConfigs/default_search`;
 
         const request = {
             servingConfig: servingConfig,
@@ -89,6 +90,8 @@ app.post("/chat", async (req, res) => {
         const [response] = await client.search(request, { autoPaginate: false });
         
         console.log(`Found ${response.results ? response.results.length : 0} results.`);
+        // DEBUG: Print the raw response to see if Google is sending warnings
+        console.log(JSON.stringify(response, null, 2));
 
         // 3. ANSWER LOGIC
         let answer = "";
@@ -112,7 +115,7 @@ app.post("/chat", async (req, res) => {
                  }
              }
              
-             // Priority C: Force Title Match
+             // Priority C: Document Titles
              if (!answer) {
                  const titles = response.results
                     .map(r => smartUnwrap(r.document.derivedStructData).title)
@@ -120,7 +123,7 @@ app.post("/chat", async (req, res) => {
                     .slice(0, 3);
                  
                  if (titles.length > 0) {
-                     answer = `I found these documents matching your query:\n• ${titles.join("\n• ")}\n\nPlease download them below to read more.`;
+                     answer = `I found these documents matching your query:\n• ${titles.join("\n• ")}\n\nPlease download them below.`;
                  }
              }
         } 

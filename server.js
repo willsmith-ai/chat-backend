@@ -5,140 +5,150 @@ const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
 const app = express();
 app.use(express.json());
 
-app.use(
-  cors({
-    origin: "*",
-  })
-);
+app.use(cors({
+    origin: "*" 
+}));
 
-// --- CONFIGURATION (KNOWN-GOOD PATH STYLE) ---
-const PROJECT = "28062079972"; // project number
-const LOCATION = "global";
-const COLLECTION_ID = "default_collection";
-const ENGINE_ID = "claretycoreai_1767340856472";
-const SERVING_CONFIG_ID = "default_serving_config";
-// --------------------------------------------
+// --- CONFIGURATION ---
+// 1. PROJECT NUMBER (Numeric)
+const PROJECT_ID = "28062079972"; 
+const LOCATION = "global"; 
 
-function fixLink(link) {
-  if (!link) return "#";
-  if (link.startsWith("gs://")) {
-    return "https://storage.googleapis.com/" + link.substring(5);
-  }
-  return link;
-}
+// 2. ENGINE ID (The "Manager")
+const ENGINE_ID = "claretycoreai_1767340856472"; 
+// ---------------------
 
+// --- HELPER: DATA CLEANER ---
 function smartUnwrap(data) {
-  if (!data) return null;
-  if (data.fields) {
-    const out = {};
-    for (const k of Object.keys(data.fields)) out[k] = unwrapValue(data.fields[k]);
-    return out;
-  }
-  return data;
-}
-function unwrapValue(v) {
-  if (!v) return null;
-  if (v.stringValue !== undefined) return v.stringValue;
-  if (v.numberValue !== undefined) return v.numberValue;
-  if (v.integerValue !== undefined) return v.integerValue;
-  if (v.boolValue !== undefined) return v.boolValue;
-  if (v.structValue) return smartUnwrap(v.structValue);
-  if (v.listValue) return (v.listValue.values || []).map(unwrapValue);
-  return v;
-}
-
-function getClient() {
-  if (!process.env.GOOGLE_JSON_KEY) throw new Error("Missing GOOGLE_JSON_KEY env var on Render");
-  const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
-  if (credentials.private_key) credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
-  return new SearchServiceClient({ credentials });
-}
-
-function getServingConfig() {
-  return `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/engines/${ENGINE_ID}/servingConfigs/${SERVING_CONFIG_ID}`;
-}
-
-app.get("/", (req, res) => res.send("Backend is running!"));
-
-// 🔎 Debug endpoint: hit /debug in your browser once after deploy
-app.get("/debug", async (req, res) => {
-  try {
-    const client = getClient();
-    const servingConfig = getServingConfig();
-
-    // broad queries to test if anything is searchable
-    const tests = ["contact", "log", "docx", "clarety"];
-
-    const results = [];
-    for (const q of tests) {
-      const [resp] = await client.search(
-        { servingConfig, query: q, pageSize: 3 },
-        { autoPaginate: false }
-      );
-
-      const items =
-        (resp.results || []).map((r) => {
-          const derived = smartUnwrap(r.document?.derivedStructData);
-          return {
-            title: derived?.title || null,
-            link: derived?.link ? fixLink(derived.link) : null,
-            id: r.document?.id || null,
-          };
-        }) || [];
-
-      results.push({ query: q, count: (resp.results || []).length, sample: items });
+    if (!data) return null;
+    if (data.fields) {
+        const result = {};
+        for (const key in data.fields) {
+            result[key] = unwrapValue(data.fields[key]);
+        }
+        return result;
     }
+    return data;
+}
 
-    res.json({ servingConfig, results });
-  } catch (e) {
-    res.status(500).json({ error: e.message, code: e.code, details: e.details });
-  }
+function unwrapValue(value) {
+    if (!value) return null;
+    if (value.stringValue !== undefined) return value.stringValue;
+    if (value.structValue) return smartUnwrap(value.structValue);
+    if (value.listValue) return value.listValue.values.map(unwrapValue);
+    return value; 
+}
+
+// --- HELPER: LINK FIXER ---
+function fixLink(link) {
+    if (!link) return "#";
+    if (link.startsWith("gs://")) {
+        return "https://storage.googleapis.com/" + link.substring(5);
+    }
+    return link;
+}
+
+app.get("/", (req, res) => {
+    res.send("Backend is running!");
 });
 
 app.post("/chat", async (req, res) => {
-  try {
-    const userQuery = (req.body.query || "").trim();
-    console.log("------------------------------------------------");
-    console.log("User asked:", userQuery);
+    try {
+        const userQuery = req.body.query;
+        console.log("------------------------------------------------");
+        console.log("User asked:", userQuery);
 
-    if (!userQuery) return res.json({ answer: "Ask me something like 'Contact Change Log'.", links: [] });
+        // 1. PERSONALITY LAYER
+        const lowerQ = (userQuery || "").toLowerCase();
+        if (lowerQ.match(/^(hi|hello|hey|greetings)/)) {
+            return res.json({ answer: "Hello! I am connected to the Clarety Knowledge Database.", links: [] });
+        }
 
-    if (/^(hi|hello|hey|greetings)\b/i.test(userQuery)) {
-      return res.json({ answer: "Hello! Try searching 'Contact Change Log' or 'Letter Export'.", links: [] });
+        // 2. CONNECT TO GOOGLE
+        if (!process.env.GOOGLE_JSON_KEY) {
+            throw new Error("Missing Google Credentials");
+        }
+        const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
+        // Safety fix for private key newlines
+        if (credentials.private_key) {
+            credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
+        }
+        const client = new SearchServiceClient({ credentials });
+
+        // --- PATH CONSTRUCTION (The Golden Path) ---
+        // 1. Use the Engine Path (No 'collections' folder)
+        // 2. Use 'default_serving_config' (The one that didn't crash in your logs)
+        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/engines/${ENGINE_ID}/servingConfigs/default_serving_config`;
+
+        console.log("Connecting to:", servingConfig); 
+
+        // --- BARE MINIMUM REQUEST ---
+        // Removed snippetSpec to prevent any chance of "Invalid Argument".
+        // If this works, we can add snippets back later.
+        const request = {
+            servingConfig: servingConfig,
+            query: userQuery,
+            pageSize: 5
+        };
+
+        const [response] = await client.search(request, { autoPaginate: false });
+        
+        console.log(`Found ${response.results ? response.results.length : 0} results.`);
+
+        // 3. ANSWER LOGIC
+        let answer = "";
+        const links = [];
+
+        // Check for AI Summary
+        if (response.summary && response.summary.summaryText) {
+            answer = response.summary.summaryText;
+        }
+
+        // Process Results
+        if (response.results && response.results.length > 0) {
+             const foundTitles = [];
+             
+             for (const result of response.results) {
+                 const data = smartUnwrap(result.document.derivedStructData);
+                 
+                 // Link
+                 if (data.link) {
+                     links.push({ 
+                         title: data.title || "View Document", 
+                         url: fixLink(data.link) 
+                     });
+                 }
+
+                 // Title
+                 if (data.title) foundTitles.push(data.title);
+             }
+
+             if (foundTitles.length > 0) {
+                 answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
+             } else {
+                 answer = "I found some relevant files. Please check the links below.";
+             }
+        } 
+        
+        if (!answer) {
+            answer = "I searched the database but couldn't find a direct match. Try searching for a specific filename.";
+        }
+
+        res.json({ answer, links });
+
+    } catch (error) {
+        console.error("Backend Error Code:", error.code);
+        console.error("Backend Error Details:", error.details);
+        console.error("Backend Error Message:", error.message);
+        
+        res.status(500).json({ 
+            answer: "I'm having trouble connecting. Check the server logs.", 
+            error: error.message 
+        });
     }
-
-    const client = getClient();
-    const servingConfig = getServingConfig();
-    console.log("Connecting to:", servingConfig);
-
-    // Minimal request — no snippetSpec, no summarySpec
-    const [response] = await client.search({ servingConfig, query: userQuery, pageSize: 5 }, { autoPaginate: false });
-
-    const found = response.results || [];
-    console.log(`Found ${found.length} results.`);
-
-    const titles = [];
-    const links = [];
-
-    for (const r of found) {
-      const derived = smartUnwrap(r.document?.derivedStructData);
-      if (derived?.title) titles.push(derived.title);
-      if (derived?.link) links.push({ title: derived.title || "View Document", url: fixLink(derived.link) });
-    }
-
-    const answer =
-      titles.length > 0
-        ? `I found these matching documents:\n• ${titles.join("\n• ")}`
-        : "I searched the database but didn't find a match. Try searching for the exact filename.";
-
-    res.json({ answer, links });
-  } catch (error) {
-    console.error("Backend Error Code:", error.code);
-    console.error("Backend Error Details:", error.details);
-    console.error("Backend Error Message:", error.message);
-    res.status(500).json({ answer: "Backend connection error.", code: error.code, details: error.details, message: error.message });
-  }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+});

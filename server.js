@@ -1,7 +1,6 @@
 const express = require("express");
 const cors = require("cors");
-// IMPORT BOTH CLIENTS: One for searching, one for checking settings
-const { SearchServiceClient, ServingConfigServiceClient } = require("@google-cloud/discoveryengine").v1beta;
+const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
 
 const app = express();
 app.use(express.json());
@@ -9,13 +8,10 @@ app.use(express.json());
 app.use(cors({ origin: "*" }));
 
 // --- CONFIGURATION ---
-const PROJECT = "28062079972"; 
-const LOCATION = "global";
-const COLLECTION_ID = "default_collection";
-const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
+// We are not guessing anymore. We are using the EXACT string provided by your /configs endpoint.
+const SERVING_CONFIG = "projects/28062079972/locations/global/collections/default_collection/engines/claretycoreai_1767340856472/servingConfigs/default_search";
 // ---------------------
 
-// Helper for Credentials
 function getCredentials() {
     if (!process.env.GOOGLE_JSON_KEY) {
         throw new Error("Missing GOOGLE_JSON_KEY env var");
@@ -27,37 +23,16 @@ function getCredentials() {
     return credentials;
 }
 
+function fixLink(link) {
+    if (!link) return "#";
+    if (link.startsWith("gs://")) {
+        return "https://storage.googleapis.com/" + link.substring(5);
+    }
+    return link;
+}
+
 app.get("/", (req, res) => res.send("Backend is running!"));
 
-// --- FIXED DIAGNOSTIC ENDPOINT ---
-app.get("/configs", async (req, res) => {
-    try {
-        const credentials = getCredentials();
-        // USE THE CORRECT CLIENT FOR LISTING CONFIGS
-        const configClient = new ServingConfigServiceClient({ credentials });
-        
-        const parent = `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}`;
-        
-        console.log(`Listing configs for: ${parent}`);
-        
-        const [configs] = await configClient.listServingConfigs({ parent });
-
-        res.json({
-            parent,
-            count: configs.length,
-            configs: configs.map(c => ({
-                name: c.name, 
-                displayName: c.displayName,
-                state: c.mediaState // Checks if it's active
-            }))
-        });
-    } catch (e) {
-        console.error("Config Error:", e);
-        res.status(500).json({ code: e.code, details: e.details, message: e.message });
-    }
-});
-
-// --- SEARCH ENDPOINT ---
 app.post("/chat", async (req, res) => {
     try {
         const userQuery = req.body.query;
@@ -67,13 +42,10 @@ app.post("/chat", async (req, res) => {
         const credentials = getCredentials();
         const client = new SearchServiceClient({ credentials });
 
-        // We are temporarily guessing 'default_search' until you run /configs
-        const servingConfig = `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
-
-        console.log("Connecting to:", servingConfig); 
+        console.log("Connecting to:", SERVING_CONFIG); 
 
         const request = {
-            servingConfig: servingConfig,
+            servingConfig: SERVING_CONFIG,
             query: userQuery,
             pageSize: 5,
             contentSearchSpec: { snippetSpec: { returnSnippet: true } }
@@ -86,32 +58,41 @@ app.post("/chat", async (req, res) => {
         let answer = "";
         const links = [];
 
+        // Check for AI Summary
+        if (response.summary && response.summary.summaryText) {
+            answer = response.summary.summaryText;
+        }
+
+        // Process Results
         if (response.results && response.results.length > 0) {
              const foundTitles = [];
              for (const result of response.results) {
                  const data = result.document.derivedStructData;
-                 
-                 // Handle nested 'fields' structure if Google wraps it
+                 // Unwrap fields if needed (sometimes Google wraps them, sometimes not)
                  const fields = data.fields ? unwrapFields(data.fields) : data;
 
                  if (fields.link) {
-                     let url = fields.link;
-                     if (url.startsWith("gs://")) {
-                         url = "https://storage.googleapis.com/" + url.substring(5);
-                     }
-                     links.push({ title: fields.title || "Document", url });
+                     links.push({ 
+                         title: fields.title || "View Document", 
+                         url: fixLink(fields.link) 
+                     });
                  }
                  if (fields.title) foundTitles.push(fields.title);
              }
 
-             if (foundTitles.length > 0) {
-                 answer = `I found these documents:\n• ${foundTitles.join("\n• ")}`;
-             } else {
-                 answer = "I found relevant files. Check the links below.";
+             // If no AI summary, use the titles
+             if (!answer) {
+                 if (foundTitles.length > 0) {
+                     answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
+                 } else {
+                     answer = "I found some relevant files. Please check the links below.";
+                 }
              }
         } 
         
-        if (!answer) answer = "No matching documents found.";
+        if (!answer) {
+            answer = "I searched the database but couldn't find a direct match. Try searching for a specific filename.";
+        }
 
         res.json({ answer, links });
 
@@ -121,7 +102,7 @@ app.post("/chat", async (req, res) => {
     }
 });
 
-// Helper to unwrap Google's messy JSON if needed
+// Helper to handle Google's inconsistent JSON structures
 function unwrapFields(fields) {
     const result = {};
     for (const key in fields) {

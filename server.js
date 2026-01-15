@@ -7,7 +7,7 @@ app.use(express.json());
 
 // Enable CORS so your GitHub Page can talk to this server
 app.use(cors({
-    origin: "*" // In production, replace "*" with your specific GitHub Pages URL for security
+    origin: "*" 
 }));
 
 // --- YOUR CONFIGURATION ---
@@ -22,26 +22,20 @@ app.get("/", (req, res) => {
 
 app.post("/chat", async (req, res) => {
     try {
-        // 1. Get the secret key from Render's secure settings
-        // We expect the key to be stored in an Environment Variable named "GOOGLE_JSON_KEY"
         if (!process.env.GOOGLE_JSON_KEY) {
             throw new Error("Missing Google Credentials");
         }
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
         
-        // 2. Setup the Google Client
         const client = new SearchServiceClient({ credentials });
         const userQuery = req.body.query;
 
         console.log("Searching for:", userQuery);
 
-        // 3. Prepare the search request
-        const servingConfig = client.servingConfigPath(
-            PROJECT_ID,
-            LOCATION,
-            DATA_STORE_ID,
-            "default_search"
-        );
+        // --- THE FIX IS HERE ---
+        // Instead of asking the client to build the path, we build it manually.
+        // This prevents "function not found" errors.
+        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
 
         const request = {
             servingConfig: servingConfig,
@@ -55,10 +49,8 @@ app.post("/chat", async (req, res) => {
             }
         };
 
-        // 4. Perform Search
         const [response] = await client.search(request);
 
-        // 5. Format the output
         let answer = "I couldn't find an answer in the documents.";
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
@@ -78,6 +70,7 @@ app.post("/chat", async (req, res) => {
 
     } catch (error) {
         console.error("Backend Error:", error);
+        // This will print the exact reason to the logs if it fails again
         res.status(500).json({ answer: "Error connecting to AI.", error: error.message });
     }
 });

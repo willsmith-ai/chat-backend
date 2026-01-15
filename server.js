@@ -9,7 +9,7 @@ app.use(cors({ origin: "*" }));
 // ===== CONFIG (only edit these) =====
 const PROJECT = "28062079972";
 const LOCATION = "global";
-const COLLECTION_ID = "default_collection";
+const COLLECTION_ID = "claretycoreai_1767340742213";
 const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store";
 // ====================================
 

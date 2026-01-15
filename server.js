@@ -22,14 +22,27 @@ app.get("/", (req, res) => {
 
 app.post("/chat", async (req, res) => {
     try {
+        const userQuery = req.body.query;
+        console.log("User asked:", userQuery);
+
+        // --- 1. HUMAN LAYER: GREETINGS ---
+        // If the user just says hello, we answer immediately without bothering Google.
+        const greetings = ["hi", "hello", "hey", "greetings", "good morning", "good afternoon"];
+        const lowerQuery = userQuery.toLowerCase().trim().replace(/[!.]/g, ""); // remove punctuation
+
+        if (greetings.includes(lowerQuery)) {
+            return res.json({ 
+                answer: "Hi there! I'm Clarety AI. I can answer questions about our community documents. How can I help you today?", 
+                links: [] 
+            });
+        }
+
+        // --- 2. CONNECT TO GOOGLE ---
         if (!process.env.GOOGLE_JSON_KEY) {
             throw new Error("Missing Google Credentials");
         }
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
         const client = new SearchServiceClient({ credentials });
-        const userQuery = req.body.query;
-
-        console.log("Searching for:", userQuery);
 
         const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/engines/${APP_ID}/servingConfigs/default_search`;
 
@@ -41,41 +54,39 @@ app.post("/chat", async (req, res) => {
                 summarySpec: {
                     summaryResultCount: 5,
                     includeCitations: true,
-                    ignoreAdversarialQuery: true // helps with "safe" queries
+                    ignoreAdversarialQuery: true 
                 },
                 snippetSpec: {
-                    returnSnippet: true // Ensure we get text snippets
+                    returnSnippet: true 
                 }
             }
         };
 
         const [response] = await client.search(request);
         
-        // LOGGING: This will print the raw Google response to your Render logs.
-        // If it still fails, checking this log will tell us WHY.
-        console.log("Google Response:", JSON.stringify(response, null, 2));
-
-        // --- SMART ANSWER LOGIC ---
-        let answer = "I couldn't find an answer in the documents.";
+        // --- 3. SMART ANSWER LOGIC ---
+        // Default "Human" failure message
+        let answer = "I checked my documents, but I couldn't find specific information about that. Could you try rephrasing your question?";
         
-        // 1. Try to get the fancy AI Summary
+        // A. Try to get the fancy AI Summary
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         } 
-        // 2. Fallback: If no summary, grab the text snippet from the first result
+        // B. Fallback: If no summary, grab the text snippet from the first result
         else if (response.results && response.results.length > 0) {
              const firstDoc = response.results[0];
-             // Try to find a text snippet in the document data
              if (firstDoc.document && firstDoc.document.derivedStructData) {
                  const data = firstDoc.document.derivedStructData;
+                 // Try to grab a snippet
                  if (data.snippets && data.snippets.length > 0) {
-                     answer = "I didn't generate a summary, but here is what I found: " + data.snippets[0].snippet;
+                     answer = "I didn't generate a full summary, but here is what I found: " + data.snippets[0].snippet;
                  } else if (data.extractive_answers && data.extractive_answers.length > 0) {
                       answer = "Result: " + data.extractive_answers[0].content;
                  }
              }
         }
 
+        // C. Extract Links
         const links = [];
         if (response.results) {
             response.results.forEach(result => {
@@ -90,7 +101,7 @@ app.post("/chat", async (req, res) => {
 
     } catch (error) {
         console.error("Backend Error:", error);
-        res.status(500).json({ answer: "Error connecting to AI.", error: error.message });
+        res.status(500).json({ answer: "I'm having a little trouble connecting to my brain right now. Please try again in a moment.", error: error.message });
     }
 });
 

@@ -10,7 +10,8 @@ app.use(cors({
 }));
 
 // --- CONFIGURATION ---
-const PROJECT_ID = "groovy-root-483105-n9"; 
+// Using Numeric Project ID (Safest option)
+const PROJECT_ID = "28062079972"; 
 const LOCATION = "global"; 
 const ENGINE_ID = "claretycoreai_1767340856472"; 
 // ---------------------
@@ -56,7 +57,7 @@ app.post("/chat", async (req, res) => {
         console.log("User asked:", userQuery);
 
         // 1. PERSONALITY LAYER
-        const lowerQ = userQuery.toLowerCase();
+        const lowerQ = (userQuery || "").toLowerCase();
         if (lowerQ.match(/^(hi|hello|hey|greetings)/)) {
             return res.json({ answer: "Hello! I am connected to the Clarety Knowledge Database. Ask me about Contact Change Logs, Letter Exports, or Templates.", links: [] });
         }
@@ -66,10 +67,14 @@ app.post("/chat", async (req, res) => {
             throw new Error("Missing Google Credentials");
         }
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
+        // Safety fix for private key newlines
+        if (credentials.private_key) {
+            credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
+        }
         const client = new SearchServiceClient({ credentials });
 
-        // --- PATH CONSTRUCTION (The ChatGPT Fix) ---
-        // We talk strictly to the Engine. The Engine knows where the data is.
+        // --- PATH CONSTRUCTION ---
+        // Engine-First Path with Numeric Project ID
         const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/engines/${ENGINE_ID}/servingConfigs/default_search`;
 
         console.log("Connecting to:", servingConfig); 
@@ -79,9 +84,8 @@ app.post("/chat", async (req, res) => {
             query: userQuery,
             pageSize: 5,
             contentSearchSpec: {
-                snippetSpec: { returnSnippet: true },
-                // We keep summarySpec because the Engine is smart enough to handle it
-                summarySpec: { summaryResultCount: 5, ignoreAdversarialQuery: true }
+                // We REMOVED summarySpec to prevent INVALID_ARGUMENT errors
+                snippetSpec: { returnSnippet: true }
             }
         };
 
@@ -93,16 +97,9 @@ app.post("/chat", async (req, res) => {
         let answer = "";
         const links = [];
 
-        // Check for AI Summary
-        if (response.summary && response.summary.summaryText) {
-            answer = response.summary.summaryText;
-        }
-
-        // Process Results
         if (response.results && response.results.length > 0) {
              const foundTitles = [];
-             let bestSnippet = "";
-
+             
              for (const result of response.results) {
                  const data = smartUnwrap(result.document.derivedStructData);
                  
@@ -116,25 +113,13 @@ app.post("/chat", async (req, res) => {
 
                  // Title
                  if (data.title) foundTitles.push(data.title);
-
-                 // Snippet
-                 if (!answer && !bestSnippet && data.snippets && data.snippets.length > 0) {
-                     let text = data.snippets[0].snippet;
-                     if (text && !text.includes("No snippet is available")) {
-                         bestSnippet = text.replace(/<[^>]*>/g, "");
-                     }
-                 }
              }
 
-             // Final Answer Construction
-             if (!answer) {
-                 if (bestSnippet) {
-                     answer = `Here is what I found:\n"${bestSnippet}"`;
-                 } else if (foundTitles.length > 0) {
-                     answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
-                 } else {
-                     answer = "I found some relevant files. Please check the links below.";
-                 }
+             // Build Response
+             if (foundTitles.length > 0) {
+                 answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
+             } else {
+                 answer = "I found some relevant files. Please check the links below.";
              }
         } 
         
@@ -145,8 +130,15 @@ app.post("/chat", async (req, res) => {
         res.json({ answer, links });
 
     } catch (error) {
-        console.error("Backend Error:", error);
-        res.status(500).json({ answer: "I'm having trouble connecting. Please try again.", error: error.message });
+        // Detailed Error Logging
+        console.error("Backend Error Code:", error.code);
+        console.error("Backend Error Details:", error.details);
+        console.error("Backend Error Message:", error.message);
+        
+        res.status(500).json({ 
+            answer: "I'm having trouble connecting. Check the server logs for details.", 
+            error: error.message 
+        });
     }
 });
 

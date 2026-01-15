@@ -1,6 +1,6 @@
 {
   "name": "chat-backend",
-  "version": "latest",
+  "version": "1.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -8,7 +8,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "@google-cloud/discoveryengine": "^0.11.0",
+    "@google-cloud/discoveryengine": "latest",
     "dotenv": "^16.0.3"
   }
 }

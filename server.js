@@ -1,28 +1,22 @@
 const express = require("express");
 const cors = require("cors");
-const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
+const { GoogleAuth } = require("google-auth-library");
+const axios = require("axios");
 
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: "*" }));
 
-// --- CONFIGURATION (Confimed by your Screenshots) ---
+// --- CONFIGURATION ---
 const PROJECT_ID = "groovy-root-483105-n9"; 
 const LOCATION = "global"; 
 const COLLECTION_ID = "default_collection";
+// We use the Engine path because the Preview uses it
 const ENGINE_ID = "claretycoreai_1767340856472"; 
 const SERVING_CONFIG_ID = "default_search";
-// ----------------------------------------------------
+// ---------------------
 
-function fixLink(link) {
-    if (!link) return "#";
-    if (link.startsWith("gs://")) {
-        return "https://storage.googleapis.com/" + link.substring(5);
-    }
-    return link;
-}
-
-app.get("/", (req, res) => res.send("Backend is running!"));
+app.get("/", (req, res) => res.send("Raw Backend is Live!"));
 
 app.post("/chat", async (req, res) => {
     try {
@@ -30,110 +24,92 @@ app.post("/chat", async (req, res) => {
         console.log("------------------------------------------------");
         console.log("User asked:", userQuery);
 
-        if (!process.env.GOOGLE_JSON_KEY) {
-            throw new Error("Missing Google Credentials");
-        }
-        const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
-        if (credentials.private_key) {
-            credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
-        }
-        const client = new SearchServiceClient({ credentials });
+        // 1. Get a fresh Access Token (The raw key to the door)
+        const auth = new GoogleAuth({
+            scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+            credentials: JSON.parse(process.env.GOOGLE_JSON_KEY)
+        });
+        const client = await auth.getClient();
+        const accessToken = await client.getAccessToken();
 
-        // --- PATH: ENGINE PATH (Confirmed by your /configs test) ---
-        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/${COLLECTION_ID}/engines/${ENGINE_ID}/servingConfigs/${SERVING_CONFIG_ID}`;
-        console.log("Connecting to:", servingConfig); 
+        // 2. Build the Raw URL
+        const url = `https://discoveryengine.googleapis.com/v1beta/projects/${PROJECT_ID}/locations/${LOCATION}/collections/${COLLECTION_ID}/engines/${ENGINE_ID}/servingConfigs/${SERVING_CONFIG_ID}:search`;
 
-        const request = {
-            servingConfig: servingConfig,
+        console.log("Hitting URL:", url);
+
+        // 3. Send the Raw Request (Mimicking the Preview Window)
+        const payload = {
             query: userQuery,
             pageSize: 5,
-            // --- THE FIX: Force Extractive Segments & Summaries ---
-            // This mimics the "Question Answering" behavior of the Preview window
-            contentSearchSpec: { 
+            contentSearchSpec: {
                 snippetSpec: { returnSnippet: true },
-                extractiveContentSpec: { maxExtractiveAnswerCount: 1 }, // "Find me the exact answer text"
                 summarySpec: { 
-                    summaryResultCount: 5, 
+                    summaryResultCount: 5,
                     includeCitations: true,
-                    ignoreAdversarialQuery: true 
+                    ignoreAdversarialQuery: true
                 }
             },
-            queryExpansionSpec: { condition: "AUTO" }, // Helps matches "log" to "logs"
+            queryExpansionSpec: { condition: "AUTO" },
             spellCorrectionSpec: { mode: "AUTO" }
         };
 
-        const [response] = await client.search(request, { autoPaginate: false });
-        
-        console.log(`Found ${response.results ? response.results.length : 0} results.`);
+        const response = await axios.post(url, payload, {
+            headers: {
+                "Authorization": `Bearer ${accessToken.token}`,
+                "Content-Type": "application/json"
+            }
+        });
+
+        // 4. Handle the Raw Response
+        const data = response.data;
+        console.log(`Google responded with: ${data.results ? data.results.length : 0} results.`);
 
         let answer = "";
         const links = [];
 
-        // 1. Check for AI Summary (Best Match)
-        if (response.summary && response.summary.summaryText) {
-            answer = response.summary.summaryText;
+        // Extract Summary
+        if (data.summary && data.summary.summaryText) {
+            answer = data.summary.summaryText;
         }
 
-        // 2. Check for Extractive Answers (Direct Text from Doc)
-        if (!answer && response.results) {
-            for (const result of response.results) {
-                const data = result.document.derivedStructData;
-                // Check if Google pulled out a specific text segment
-                if (data.extractive_answers && data.extractive_answers.length > 0) {
-                    answer = data.extractive_answers[0].content;
-                    break;
+        // Extract Documents
+        if (data.results) {
+            data.results.forEach(item => {
+                const docData = item.document.derivedStructData;
+                const title = docData.title || docData.fields?.title?.stringValue || "Document";
+                let link = docData.link || docData.fields?.link?.stringValue || "";
+                
+                if (link.startsWith("gs://")) {
+                    link = "https://storage.googleapis.com/" + link.substring(5);
                 }
-            }
+
+                if (link) {
+                    links.push({ title, url: link });
+                }
+            });
         }
 
-        // 3. Process Links
-        if (response.results && response.results.length > 0) {
-             const foundTitles = [];
-             for (const result of response.results) {
-                 const data = result.document.derivedStructData;
-                 
-                 // Handle Google's varying JSON structure
-                 const fields = data.fields ? unwrapFields(data.fields) : data;
-
-                 if (fields.link) {
-                     links.push({ 
-                         title: fields.title || "View Document", 
-                         url: fixLink(fields.link) 
-                     });
-                 }
-                 if (fields.title) foundTitles.push(fields.title);
-             }
-
-             if (!answer) {
-                 if (foundTitles.length > 0) {
-                     answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
-                 } else {
-                     answer = "I found relevant files. Check the links below.";
-                 }
-             }
-        } 
-        
         if (!answer) {
-            answer = "I searched the database but couldn't find a direct match. Try searching for a specific filename.";
+             if (links.length > 0) {
+                 answer = "I found these relevant documents:";
+             } else {
+                 answer = "I couldn't find a direct answer in the documents.";
+             }
         }
 
         res.json({ answer, links });
 
     } catch (error) {
-        console.error("Backend Error:", error);
-        res.status(500).json({ answer: "Connection error.", error: error.message });
+        // Detailed Error Logging
+        if (error.response) {
+            console.error("Google API Error:", JSON.stringify(error.response.data, null, 2));
+            res.status(500).json({ answer: "Google API Error", details: error.response.data });
+        } else {
+            console.error("Server Error:", error.message);
+            res.status(500).json({ answer: "Server connection failed." });
+        }
     }
 });
-
-// Helper to unwrap fields cleanly
-function unwrapFields(fields) {
-    const result = {};
-    for (const key in fields) {
-        const val = fields[key];
-        result[key] = val.stringValue || val;
-    }
-    return result;
-}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

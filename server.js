@@ -4,152 +4,154 @@ const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
 
 const app = express();
 app.use(express.json());
+
 app.use(cors({ origin: "*" }));
 
-// ===== CONFIG (only edit these) =====
-const PROJECT = "28062079972";
+// --- CONFIGURATION ---
+const PROJECT = "28062079972"; 
 const LOCATION = "global";
-const COLLECTION_ID = "claretycoreai_1767340742213";
-const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store";
-// ====================================
+const COLLECTION_ID = "default_collection";
+// This is the Data Store ID confirmed by your screenshots
+const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
+// ---------------------
+
+// Helper to get authorized client
+function getClient() {
+    if (!process.env.GOOGLE_JSON_KEY) {
+        throw new Error("Missing GOOGLE_JSON_KEY env var");
+    }
+    const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
+    if (credentials.private_key) {
+        credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
+    }
+    return new SearchServiceClient({ credentials });
+}
 
 function fixLink(link) {
-  if (!link) return null;
-  if (link.startsWith("gs://")) return "https://storage.googleapis.com/" + link.substring(5);
-  return link;
+    if (!link) return "#";
+    if (link.startsWith("gs://")) {
+        return "https://storage.googleapis.com/" + link.substring(5);
+    }
+    return link;
 }
 
 function smartUnwrap(data) {
-  if (!data) return null;
-  if (data.fields) {
-    const out = {};
-    for (const k of Object.keys(data.fields)) out[k] = unwrapValue(data.fields[k]);
-    return out;
-  }
-  return data;
-}
-function unwrapValue(v) {
-  if (!v) return null;
-  if (v.stringValue !== undefined) return v.stringValue;
-  if (v.numberValue !== undefined) return v.numberValue;
-  if (v.integerValue !== undefined) return v.integerValue;
-  if (v.boolValue !== undefined) return v.boolValue;
-  if (v.structValue) return smartUnwrap(v.structValue);
-  if (v.listValue) return (v.listValue.values || []).map(unwrapValue);
-  return v;
-}
-
-function getClient() {
-  if (!process.env.GOOGLE_JSON_KEY) throw new Error("Missing GOOGLE_JSON_KEY env var on Render");
-  const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
-  if (credentials.private_key) credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
-  return new SearchServiceClient({ credentials });
-}
-
-function datastoreServingConfig(id) {
-  // ✅ DATA STORE path (NOT engines/)
-  return `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/${id}`;
-}
-
-async function searchDatastore(client, query) {
-  // Try both common ids
-  const ids = ["default_search", "default_serving_config"];
-  let lastErr;
-
-  for (const id of ids) {
-    const servingConfig = datastoreServingConfig(id);
-    try {
-      const request = {
-        servingConfig,
-        query,
-        pageSize: 5,
-        // Keep minimal; if this causes INVALID_ARGUMENT, we’ll remove it
-        contentSearchSpec: { snippetSpec: { returnSnippet: true } },
-      };
-
-      const [resp] = await client.search(request, { autoPaginate: false });
-      return { servingConfig, resp };
-    } catch (e) {
-      lastErr = e;
-      // only try the next id if it’s likely just a naming mismatch
-      if (![3, 5].includes(e.code)) break;
+    if (!data) return null;
+    if (data.fields) {
+        const result = {};
+        for (const key in data.fields) {
+            result[key] = unwrapValue(data.fields[key]);
+        }
+        return result;
     }
-  }
+    return data;
+}
 
-  throw lastErr || new Error("Search failed");
+function unwrapValue(value) {
+    if (!value) return null;
+    if (value.stringValue !== undefined) return value.stringValue;
+    if (value.structValue) return smartUnwrap(value.structValue);
+    if (value.listValue) return value.listValue.values.map(unwrapValue);
+    return value; 
 }
 
 app.get("/", (req, res) => res.send("Backend is running!"));
 
-// Debug endpoint: https://claretycoreapi.onrender.com/debug?q=contact
-app.get("/debug", async (req, res) => {
-  try {
-    const q = (req.query.q || "contact").toString().trim();
-    const client = getClient();
-    const { servingConfig, resp } = await searchDatastore(client, q);
+// --- NEW DIAGNOSTIC ENDPOINT (From ChatGPT's Strategy) ---
+app.get("/configs", async (req, res) => {
+    try {
+        const client = getClient();
+        const parent = `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}`;
+        
+        console.log(`Listing configs for: ${parent}`);
+        
+        // Ask Google what serving configs exist
+        const [configs] = await client.listServingConfigs({ parent });
 
-    const results = (resp.results || []).map((r) => {
-      const derived = smartUnwrap(r.document?.derivedStructData);
-      return {
-        id: r.document?.id || null,
-        title: derived?.title || null,
-        link: fixLink(derived?.link || derived?.uri || null),
-        derivedKeys: derived ? Object.keys(derived) : [],
-      };
-    });
-
-    res.json({ servingConfig, count: results.length, results });
-  } catch (e) {
-    res.status(500).json({ code: e.code, details: e.details, message: e.message });
-  }
+        res.json({
+            parent,
+            count: configs.length,
+            configs: configs.map(c => ({
+                name: c.name, // The full path we need
+                displayName: c.displayName,
+                // We also check the state to see if it's actually active
+                mediaState: c.mediaState 
+            }))
+        });
+    } catch (e) {
+        console.error("Config Error:", e);
+        res.status(500).json({ code: e.code, details: e.details, message: e.message });
+    }
 });
 
+// --- CHAT ENDPOINT ---
 app.post("/chat", async (req, res) => {
-  try {
-    const userQuery = (req.body?.query || "").trim();
-    console.log("------------------------------------------------");
-    console.log("User asked:", userQuery);
+    try {
+        const userQuery = req.body.query;
+        console.log("------------------------------------------------");
+        console.log("User asked:", userQuery);
 
-    if (!userQuery) return res.json({ answer: "Ask me something like 'Contact Change Log'.", links: [] });
+        const client = getClient();
 
-    if (/^(hi|hello|hey|greetings)\b/i.test(userQuery)) {
-      return res.json({
-        answer: "Hi! I can search your Clarety Knowledge Database. Try 'Contact Change Log'.",
-        links: [],
-      });
+        // We currently guess "default_search" - the /configs endpoint will tell us if this is right.
+        const servingConfig = `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
+
+        console.log("Connecting to:", servingConfig); 
+
+        const request = {
+            servingConfig: servingConfig,
+            query: userQuery,
+            pageSize: 5,
+            contentSearchSpec: { snippetSpec: { returnSnippet: true } }
+        };
+
+        const [response] = await client.search(request, { autoPaginate: false });
+        
+        console.log(`Found ${response.results ? response.results.length : 0} results.`);
+
+        let answer = "";
+        const links = [];
+
+        if (response.summary && response.summary.summaryText) {
+            answer = response.summary.summaryText;
+        }
+
+        if (response.results && response.results.length > 0) {
+             const foundTitles = [];
+             for (const result of response.results) {
+                 const data = smartUnwrap(result.document.derivedStructData);
+                 
+                 if (data.link) {
+                     links.push({ 
+                         title: data.title || "View Document", 
+                         url: fixLink(data.link) 
+                     });
+                 }
+                 if (data.title) foundTitles.push(data.title);
+             }
+
+             if (!answer) {
+                 if (foundTitles.length > 0) {
+                     answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
+                 } else {
+                     answer = "I found some relevant files. Please check the links below.";
+                 }
+             }
+        } 
+        
+        if (!answer) {
+            answer = "I searched the database but couldn't find a direct match. Try searching for a specific filename.";
+        }
+
+        res.json({ answer, links });
+
+    } catch (error) {
+        console.error("Backend Error:", error);
+        res.status(500).json({ answer: "Connection error.", error: error.message });
     }
-
-    const client = getClient();
-    const { servingConfig, resp } = await searchDatastore(client, userQuery);
-
-    console.log("Using servingConfig:", servingConfig);
-    console.log("Results:", (resp.results || []).length);
-
-    const links = [];
-    const titles = [];
-
-    for (const r of resp.results || []) {
-      const derived = smartUnwrap(r.document?.derivedStructData);
-      const title = derived?.title || r.document?.id || "Document";
-      const url = fixLink(derived?.link || derived?.uri || null);
-
-      titles.push(title);
-      if (url) links.push({ title, url });
-    }
-
-    const answer =
-      titles.length > 0
-        ? `Top matching documents:\n• ${titles.join("\n• ")}`
-        : "No matches found. Try searching the exact filename (e.g. 'Contact Change Log.docx').";
-
-    return res.json({ answer, links });
-  } catch (e) {
-    console.error("Backend Error Code:", e.code);
-    console.error("Backend Error Details:", e.details);
-    console.error("Backend Error Message:", e.message);
-    res.status(500).json({ answer: "Search backend error (see logs).", code: e.code, details: e.details, message: e.message });
-  }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+});

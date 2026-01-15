@@ -8,14 +8,13 @@ app.use(express.json());
 app.use(cors({ origin: "*" }));
 
 // --- CONFIGURATION ---
-// 1. PROJECT ID: STRING (Confirmed working in Turn 5)
+// 1. PROJECT ID: STRING (Matches the Preview URL)
 const PROJECT_ID = "groovy-root-483105-n9"; 
 const LOCATION = "global"; 
 const COLLECTION_ID = "default_collection";
 
-// 2. TARGET: DATA STORE ID (Confirmed working in Turn 5)
-// We are bypassing the Engine ID entirely.
-const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
+// 2. TARGET: ENGINE (Matches the Preview Context)
+const ENGINE_ID = "claretycoreai_1767340856472"; 
 const SERVING_CONFIG_ID = "default_search";
 // ---------------------
 
@@ -53,9 +52,9 @@ app.post("/chat", async (req, res) => {
         }
         const client = new SearchServiceClient({ credentials });
 
-        // --- THE CRITICAL FIX ---
-        // We are using the DATA STORE path. This is the only path that has ever worked for you.
-        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/${SERVING_CONFIG_ID}`;
+        // --- PATH CONSTRUCTION ---
+        // We are using the ENGINE path because the Preview works there.
+        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/${COLLECTION_ID}/engines/${ENGINE_ID}/servingConfigs/${SERVING_CONFIG_ID}`;
 
         console.log("Connecting to:", servingConfig); 
 
@@ -63,8 +62,10 @@ app.post("/chat", async (req, res) => {
             servingConfig: servingConfig,
             query: userQuery,
             pageSize: 5,
+            // We enable Summaries because your screenshot shows the Preview generating one.
             contentSearchSpec: { 
-                snippetSpec: { returnSnippet: true } 
+                snippetSpec: { returnSnippet: true },
+                summarySpec: { summaryResultCount: 5, ignoreAdversarialQuery: true }
             },
             queryExpansionSpec: { condition: "AUTO" },
             spellCorrectionSpec: { mode: "AUTO" }
@@ -77,7 +78,7 @@ app.post("/chat", async (req, res) => {
         let answer = "";
         const links = [];
 
-        // 1. Check for AI Summary
+        // 1. Check for AI Summary (This is what appears in your screenshot)
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         }
@@ -116,6 +117,7 @@ app.post("/chat", async (req, res) => {
 
     } catch (error) {
         console.error("Backend Error:", error);
+        // Important: Log the specific error code to see if we hit INVALID_ARGUMENT again
         res.status(500).json({ answer: "I'm having trouble connecting.", error: error.message });
     }
 });

@@ -5,19 +5,19 @@ const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
 const app = express();
 app.use(express.json());
 
-// Enable CORS so your GitHub Page can talk to this server
+// Enable CORS
 app.use(cors({
     origin: "*" 
 }));
 
-// --- YOUR CONFIGURATION ---
+// --- CONFIGURATION ---
 const PROJECT_ID = "groovy-root-483105-n9"; 
 const DATA_STORE_ID = "claretycommunityai_1767529726880"; 
 const LOCATION = "global"; 
-// --------------------------
+// ---------------------
 
 app.get("/", (req, res) => {
-    res.send("Backend is running! Use /chat to search.");
+    res.send("Backend is running!");
 });
 
 app.post("/chat", async (req, res) => {
@@ -26,16 +26,14 @@ app.post("/chat", async (req, res) => {
             throw new Error("Missing Google Credentials");
         }
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
-        
         const client = new SearchServiceClient({ credentials });
         const userQuery = req.body.query;
 
         console.log("Searching for:", userQuery);
 
         // --- THE FIX IS HERE ---
-        // Instead of asking the client to build the path, we build it manually.
-        // This prevents "function not found" errors.
-        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
+        // We changed 'dataStores' to 'engines' because you are using a Search App.
+        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/engines/${DATA_STORE_ID}/servingConfigs/default_search`;
 
         const request = {
             servingConfig: servingConfig,
@@ -70,7 +68,6 @@ app.post("/chat", async (req, res) => {
 
     } catch (error) {
         console.error("Backend Error:", error);
-        // This will print the exact reason to the logs if it fails again
         res.status(500).json({ answer: "Error connecting to AI.", error: error.message });
     }
 });

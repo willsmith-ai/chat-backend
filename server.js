@@ -26,11 +26,11 @@ app.post("/chat", async (req, res) => {
         console.log("User asked:", userQuery);
 
         // --- 1. HUMAN LAYER: GREETINGS ---
-        // If the user just says hello, we answer immediately without bothering Google.
         const greetings = ["hi", "hello", "hey", "greetings", "good morning", "good afternoon"];
-        const lowerQuery = userQuery.toLowerCase().trim().replace(/[!.]/g, ""); // remove punctuation
+        // Clean up the input (remove punctuation, make lowercase)
+        const cleanQuery = userQuery.toLowerCase().trim().replace(/[!.,?]/g, "");
 
-        if (greetings.includes(lowerQuery)) {
+        if (greetings.includes(cleanQuery)) {
             return res.json({ 
                 answer: "Hi there! I'm Clarety AI. I can answer questions about our community documents. How can I help you today?", 
                 links: [] 
@@ -49,7 +49,7 @@ app.post("/chat", async (req, res) => {
         const request = {
             servingConfig: servingConfig,
             query: userQuery,
-            pageSize: 3,
+            pageSize: 5, // Fetch a few more to increase chances of finding a good snippet
             contentSearchSpec: {
                 summarySpec: {
                     summaryResultCount: 5,
@@ -65,23 +65,35 @@ app.post("/chat", async (req, res) => {
         const [response] = await client.search(request);
         
         // --- 3. SMART ANSWER LOGIC ---
-        // Default "Human" failure message
         let answer = "I checked my documents, but I couldn't find specific information about that. Could you try rephrasing your question?";
         
-        // A. Try to get the fancy AI Summary
+        // A. Try to get the fancy AI Summary first
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         } 
-        // B. Fallback: If no summary, grab the text snippet from the first result
+        // B. Fallback: Search for the first *valid* text snippet
         else if (response.results && response.results.length > 0) {
-             const firstDoc = response.results[0];
-             if (firstDoc.document && firstDoc.document.derivedStructData) {
-                 const data = firstDoc.document.derivedStructData;
-                 // Try to grab a snippet
+             
+             for (const result of response.results) {
+                 const data = result.document.derivedStructData;
+                 if (!data) continue;
+
+                 // Check for Extractive Answers (Best quality)
+                 if (data.extractive_answers && data.extractive_answers.length > 0) {
+                     answer = data.extractive_answers[0].content;
+                     break; // Found a good one, stop looking
+                 }
+                 
+                 // Check for Snippets (Standard quality)
                  if (data.snippets && data.snippets.length > 0) {
-                     answer = "I didn't generate a full summary, but here is what I found: " + data.snippets[0].snippet;
-                 } else if (data.extractive_answers && data.extractive_answers.length > 0) {
-                      answer = "Result: " + data.extractive_answers[0].content;
+                     let snippetText = data.snippets[0].snippet;
+                     
+                     // CRITICAL FIX: Ignore useless "No snippet" messages
+                     if (snippetText && !snippetText.includes("No snippet is available")) {
+                         // Clean up HTML tags (remove <b>, </b>, etc.)
+                         answer = "I found this in the documents: " + snippetText.replace(/<[^>]*>/g, "");
+                         break; // Found a good one, stop looking
+                     }
                  }
              }
         }

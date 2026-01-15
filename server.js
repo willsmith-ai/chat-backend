@@ -15,12 +15,10 @@ const APP_ID = "claretycoreai_1767340856472";
 const LOCATION = "global"; 
 // ---------------------
 
-// --- HELPER: SMART UNWRAPPER ---
-// Handles both "Messy" (Proto) and "Clean" (JSON) data from Google
+// --- HELPER: DATA CLEANER ---
+// Turns Google's messy "fields" and "stringValue" into normal JSON
 function smartUnwrap(data) {
     if (!data) return null;
-    
-    // Case 1: It's the messy "fields" format
     if (data.fields) {
         const result = {};
         for (const key in data.fields) {
@@ -28,25 +26,22 @@ function smartUnwrap(data) {
         }
         return result;
     }
-    
-    // Case 2: It's already clean! Return as-is.
-    return data;
+    return data; // It was already clean
 }
 
 function unwrapValue(value) {
     if (!value) return null;
-    if (value.stringValue) return value.stringValue;
+    if (value.stringValue !== undefined) return value.stringValue;
     if (value.structValue) return smartUnwrap(value.structValue);
     if (value.listValue) return value.listValue.values.map(unwrapValue);
     return value; 
 }
 
 // --- HELPER: LINK FIXER ---
-// Converts "gs://" links to clickable "https://" links
 function fixLink(link) {
     if (!link) return "#";
+    // Convert Google Storage links (gs://) to Downloadable Links (https://)
     if (link.startsWith("gs://")) {
-        // Remove "gs://" and prepend the public storage URL
         return "https://storage.googleapis.com/" + link.substring(5);
     }
     return link;
@@ -60,25 +55,16 @@ app.get("/", (req, res) => {
 app.post("/chat", async (req, res) => {
     try {
         const userQuery = req.body.query;
+        console.log("------------------------------------------------");
         console.log("User asked:", userQuery);
 
-        // --- 1. PERSONALITY LAYER ---
+        // 1. PERSONALITY LAYER
         const lowerQ = userQuery.toLowerCase();
-        
-        // Custom Greetings
         if (lowerQ.match(/^(hi|hello|hey|greetings)/)) {
-            return res.json({ answer: "Hello! Ask me anything about the Clarety community documents.", links: [] });
-        }
-        // Custom Help Topics
-        if (lowerQ.includes("topics") || lowerQ.includes("what do you know")) {
-            return res.json({ answer: "I can help with Contact Change Logs, Letter Exports, Campaign Pages, and Email Templates. What do you need?", links: [] });
-        }
-        // Custom Status Check
-        if (lowerQ.includes("how are you")) {
-            return res.json({ answer: "I'm functioning perfectly and connected to the Knowledge Database.", links: [] });
+            return res.json({ answer: "Hello! I am connected to the Clarety Knowledge Database. Try asking for 'Contact Change Logs' or 'Email Templates'.", links: [] });
         }
 
-        // --- 2. GOOGLE SEARCH ---
+        // 2. CONNECT TO GOOGLE
         if (!process.env.GOOGLE_JSON_KEY) {
             throw new Error("Missing Google Credentials");
         }
@@ -87,6 +73,7 @@ app.post("/chat", async (req, res) => {
 
         const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/engines/${APP_ID}/servingConfigs/default_search`;
 
+        // We removed 'extractiveContentSpec' to make the search faster and broader
         const request = {
             servingConfig: servingConfig,
             query: userQuery,
@@ -99,20 +86,28 @@ app.post("/chat", async (req, res) => {
 
         const [response] = await client.search(request, { autoPaginate: false });
         
-        // --- 3. SMART ANSWER LOGIC ---
+        // --- DEBUG LOGGING (Check Render Logs if it fails!) ---
+        console.log(`Found ${response.results ? response.results.length : 0} results.`);
+        if (response.results && response.results.length > 0) {
+            const firstTitle = smartUnwrap(response.results[0].document.derivedStructData).title;
+            console.log("Top Result Title:", firstTitle);
+        }
+        // -----------------------------------------------------
+
+        // 3. SMART ANSWER LOGIC
         let answer = "";
         
-        // Strategy A: AI Summary
+        // Priority A: AI Summary
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         } 
-        // Strategy B: Search for ANY valid text snippet
+        
+        // Priority B: Snippets
         else if (response.results && response.results.length > 0) {
-             
-             // Try to find a good snippet
              for (const result of response.results) {
                  const data = smartUnwrap(result.document.derivedStructData);
                  
+                 // Look for text snippet
                  if (data.snippets && data.snippets.length > 0) {
                      let text = data.snippets[0].snippet;
                      if (text && !text.includes("No snippet is available")) {
@@ -122,24 +117,25 @@ app.post("/chat", async (req, res) => {
                  }
              }
              
-             // Strategy C: If STILL no text, list the Document Titles
+             // Priority C: Force Title Match (The "Prove it" fallback)
              if (!answer) {
                  const titles = response.results
                     .map(r => smartUnwrap(r.document.derivedStructData).title)
-                    .filter(t => t) // remove empty titles
-                    .slice(0, 3);   // take top 3
+                    .filter(t => t)
+                    .slice(0, 3);
                  
                  if (titles.length > 0) {
-                     answer = "I found these documents that seem relevant:\n• " + titles.join("\n• ");
-                 } else {
-                     answer = "I found some documents, but I couldn't read their titles or content. Please check the links below.";
+                     answer = `I found these documents in the database that match your query:\n• ${titles.join("\n• ")}\n\nPlease open them below to read the full content.`;
                  }
              }
-        } else {
-            answer = "I couldn't find any documents matching that question.";
+        } 
+        
+        // Default Failure Message
+        if (!answer) {
+            answer = "I searched the database, but I couldn't find a document that matches those keywords. Try searching for the exact document title (e.g., 'Contact Change Log').";
         }
 
-        // --- 4. FORMAT LINKS ---
+        // 4. LINKS
         const links = [];
         if (response.results) {
             response.results.forEach(result => {
@@ -147,7 +143,7 @@ app.post("/chat", async (req, res) => {
                 if (data.link) {
                     links.push({ 
                         title: data.title || "Download Document", 
-                        url: fixLink(data.link) // Convert gs:// to https://
+                        url: fixLink(data.link) 
                     });
                 }
             });
@@ -157,7 +153,7 @@ app.post("/chat", async (req, res) => {
 
     } catch (error) {
         console.error("Backend Error:", error);
-        res.status(500).json({ answer: "I'm having a little trouble connecting. Please try again.", error: error.message });
+        res.status(500).json({ answer: "I'm having trouble connecting. Please try again.", error: error.message });
     }
 });
 

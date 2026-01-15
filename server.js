@@ -11,8 +11,8 @@ app.use(cors({
 
 // --- CONFIGURATION ---
 const PROJECT_ID = "groovy-root-483105-n9"; 
-// We are switching back to the DATA STORE ID (The "Library")
-const DATA_STORE_ID = "claretycoreai_1767340742213"; 
+// THE FIX: We added "_gcs_store" to the end of this ID
+const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
 const LOCATION = "global"; 
 // ---------------------
 
@@ -69,7 +69,7 @@ app.post("/chat", async (req, res) => {
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
         const client = new SearchServiceClient({ credentials });
 
-        // NOTICE: We switched from 'engines' back to 'dataStores'
+        // We use the Data Store path, which works best for raw file retrieval
         const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
 
         const request = {
@@ -97,7 +97,7 @@ app.post("/chat", async (req, res) => {
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         } 
-        // Priority B: Snippets from the Data Store
+        // Priority B: Snippets
         else if (response.results && response.results.length > 0) {
              for (const result of response.results) {
                  const data = smartUnwrap(result.document.derivedStructData);

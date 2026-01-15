@@ -1,23 +1,24 @@
 const express = require("express");
 const cors = require("cors");
-const { ConversationalSearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
+const { SearchServiceClient } =
+  require("@google-cloud/discoveryengine").v1beta;
 
 const app = express();
 app.use(express.json());
-
 app.use(cors({ origin: "*" }));
 
-// --- CONFIGURATION ---
-const PROJECT = "28062079972"; 
+// =====================
+// CONFIG (DO NOT GUESS)
+// =====================
+const PROJECT_NUMBER = "28062079972";
 const LOCATION = "global";
 const COLLECTION_ID = "default_collection";
+const ENGINE_ID = "claretycoreai_1767340856472";
 
-// IMPORTANT: Using DATA STORE ID (Not Engine ID)
-const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store";
-
-// Serving config name
+// This is the SEARCH serving config used by Preview
 const SERVING_CONFIG_ID = "default_search";
-// ---------------------
+
+// =====================
 
 function fixLink(link) {
   if (!link) return null;
@@ -27,27 +28,22 @@ function fixLink(link) {
   return link;
 }
 
-app.get("/", (req, res) => res.send("Backend is running!"));
+app.get("/", (req, res) => {
+  res.send("Backend is running!");
+});
 
 app.post("/chat", async (req, res) => {
   try {
-    const userQuery = (req.body?.query || "").trim();
+    const query = (req.body?.query || "").trim();
     console.log("------------------------------------------------");
-    console.log("User asked:", userQuery);
+    console.log("User asked:", query);
 
-    if (!userQuery) {
-      return res.json({ answer: "Ask me a question.", links: [] });
-    }
-
-    if (/^(hi|hello|hey|greetings)\b/i.test(userQuery)) {
-      return res.json({
-        answer: "Hi! Ask me about Clarety documents (e.g. Contact Change Log).",
-        links: [],
-      });
+    if (!query) {
+      return res.json({ answer: "Ask me something.", links: [] });
     }
 
     if (!process.env.GOOGLE_JSON_KEY) {
-      throw new Error("Missing GOOGLE_JSON_KEY env var on Render");
+      throw new Error("Missing GOOGLE_JSON_KEY");
     }
 
     const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
@@ -55,60 +51,73 @@ app.post("/chat", async (req, res) => {
       credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
     }
 
-    const client = new ConversationalSearchServiceClient({ credentials });
+    const client = new SearchServiceClient({ credentials });
 
-    // Resource Path: Data Store Conversational
-    const conversationName = `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/conversations/-`;
+    // 🔑 THIS IS THE PREVIEW PATH
+    const servingConfig =
+      `projects/${PROJECT_NUMBER}` +
+      `/locations/${LOCATION}` +
+      `/collections/${COLLECTION_ID}` +
+      `/engines/${ENGINE_ID}` +
+      `/servingConfigs/${SERVING_CONFIG_ID}`;
 
-    // Serving Config Path
-    const servingConfig = `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/${SERVING_CONFIG_ID}`;
-
-    console.log("Conversation name:", conversationName);
-    console.log("Serving config:", servingConfig);
+    console.log("Using servingConfig:", servingConfig);
 
     const request = {
-      name: conversationName,
-      servingConfig: servingConfig,
-      query: { text: userQuery },
+      servingConfig,
+      query,
+      pageSize: 5,
+      contentSearchSpec: {
+        snippetSpec: { returnSnippet: true }
+      }
     };
 
-    const [response] = await client.converseConversation(request);
+    const [response] = await client.search(request);
 
-    // Answer Extraction
-    const answer = response?.reply?.reply || "No answer returned.";
+    console.log("Results:", response.results?.length || 0);
 
-    // Link Extraction
+    // =====================
+    // FORMAT LIKE PREVIEW
+    // =====================
+    let answer = "";
     const links = [];
-    const refs = response?.reply?.references || [];
-    for (const r of refs) {
-      // Try to find the title in various places
-      const title =
-        r?.document?.title ||
-        r?.document?.id ||
-        "Document";
 
-      // Try to find the link in various places
-      const rawLink = r?.document?.derivedStructData?.link || r?.uri;
-      const url = fixLink(rawLink);
+    if (response.results && response.results.length > 0) {
+      const titles = [];
 
-      if (url) links.push({ title, url });
+      for (const r of response.results) {
+        const data = r.document?.derivedStructData?.fields || {};
+
+        const title = data.title?.stringValue;
+        const link = data.link?.stringValue;
+
+        if (title) titles.push(title);
+        if (link) {
+          links.push({
+            title: title || "View document",
+            url: fixLink(link)
+          });
+        }
+      }
+
+      answer =
+        "Here’s what I found:\n\n" +
+        titles.map(t => `• ${t}`).join("\n");
+    } else {
+      answer = "No matching documents found.";
     }
 
     res.json({ answer, links });
-
-  } catch (error) {
-    console.error("Backend Error Code:", error.code);
-    console.error("Backend Error Details:", error.details);
-    console.error("Backend Error Message:", error.message);
-
+  } catch (err) {
+    console.error("ERROR:", err.message);
     res.status(500).json({
-      answer: "Backend chat error (see logs).",
-      code: error.code,
-      details: error.details,
-      message: error.message,
+      answer: "Backend error",
+      error: err.message
     });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});

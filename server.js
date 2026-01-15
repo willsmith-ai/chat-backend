@@ -42,7 +42,6 @@ app.post("/chat", async (req, res) => {
       credentials: getCredentials(),
     });
 
-    // 🔑 THIS IS THE KEY CHANGE
     const servingConfig = `
 projects/${PROJECT_NUMBER}/locations/${LOCATION}
   /collections/${COLLECTION_ID}
@@ -57,6 +56,13 @@ projects/${PROJECT_NUMBER}/locations/${LOCATION}
         servingConfig,
         query,
         pageSize: 10,
+
+        // 🔑 THIS IS THE FIX
+        userPseudoId: "clarety-web-user",
+
+        // Optional but recommended
+        spellCorrectionSpec: { mode: "AUTO" },
+        queryExpansionSpec: { condition: "AUTO" },
       },
       { autoPaginate: false }
     );

@@ -10,11 +10,10 @@ app.use(cors({
 }));
 
 // --- CONFIGURATION ---
-// We are using the PROJECT NUMBER from your logs (Safe Mode)
-const PROJECT_ID = "28062079972"; 
+// I pulled these exactly from the successful log you just sent:
+const PROJECT_NUMBER = "28062079972"; 
 const LOCATION = "global"; 
-// We are using the APP ID (The Brain)
-const APP_ID = "claretycoreai_1767340856472"; 
+const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
 // ---------------------
 
 // --- HELPER: DATA CLEANER ---
@@ -39,9 +38,12 @@ function unwrapValue(value) {
 }
 
 // --- HELPER: LINK FIXER ---
+// Your logs show links like: gs://claretycoreaibucket/...
+// Browsers can't open "gs://". We must change it to "https://"
 function fixLink(link) {
     if (!link) return "#";
     if (link.startsWith("gs://")) {
+        // We replace "gs://" with the public storage URL
         return "https://storage.googleapis.com/" + link.substring(5);
     }
     return link;
@@ -54,13 +56,12 @@ app.get("/", (req, res) => {
 app.post("/chat", async (req, res) => {
     try {
         const userQuery = req.body.query;
-        console.log("------------------------------------------------");
         console.log("User asked:", userQuery);
 
         // 1. PERSONALITY LAYER
         const lowerQ = userQuery.toLowerCase();
-        if (lowerQ.match(/^(hi|hello|hey|greetings)/)) {
-            return res.json({ answer: "Hello! I am connected to the Clarety Knowledge Database. Try searching for 'Contact Change Log'.", links: [] });
+        if (lowerQ.match(/^(hi|hello|hey)/)) {
+            return res.json({ answer: "Hello! I am connected to the Clarety Knowledge Database.", links: [] });
         }
 
         // 2. CONNECT TO GOOGLE
@@ -70,19 +71,15 @@ app.post("/chat", async (req, res) => {
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
         const client = new SearchServiceClient({ credentials });
 
-        // We use the ENGINES path (The Brain)
-        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/engines/${APP_ID}/servingConfigs/default_search`;
+        // Using the DataStore path because your logs confirm this is what returns data
+        const servingConfig = `projects/${PROJECT_NUMBER}/locations/${LOCATION}/collections/default_collection/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
 
         const request = {
             servingConfig: servingConfig,
             query: userQuery,
             pageSize: 5,
             contentSearchSpec: {
-                summarySpec: { 
-                    summaryResultCount: 5, 
-                    ignoreAdversarialQuery: true,
-                    includeCitations: true
-                },
+                // We ask for snippets, but we won't crash if we don't get them
                 snippetSpec: { returnSnippet: true }
             }
         };
@@ -90,67 +87,49 @@ app.post("/chat", async (req, res) => {
         const [response] = await client.search(request, { autoPaginate: false });
         
         console.log(`Found ${response.results ? response.results.length : 0} results.`);
-        // DEBUG: Print the raw response to see if Google is sending warnings
-        console.log(JSON.stringify(response, null, 2));
 
-        // 3. ANSWER LOGIC
+        // 3. ROBUST ANSWER LOGIC
         let answer = "";
-        
-        // Priority A: AI Summary
-        if (response.summary && response.summary.summaryText) {
-            answer = response.summary.summaryText;
-        } 
-        // Priority B: Snippets
-        else if (response.results && response.results.length > 0) {
+        const links = [];
+
+        if (response.results && response.results.length > 0) {
+             const foundTitles = [];
+             
+             // Loop through EVERY result found
              for (const result of response.results) {
                  const data = smartUnwrap(result.document.derivedStructData);
                  
-                 // Look for text snippet
-                 if (data.snippets && data.snippets.length > 0) {
-                     let text = data.snippets[0].snippet;
-                     if (text && !text.includes("No snippet is available")) {
-                         answer = "Here is a relevant excerpt: " + text.replace(/<[^>]*>/g, "");
-                         break;
-                     }
+                 // Save the link if it exists
+                 if (data.link) {
+                     links.push({ 
+                         title: data.title || "View Document", 
+                         url: fixLink(data.link) 
+                     });
+                 }
+
+                 // Collect the title
+                 if (data.title) {
+                     foundTitles.push(data.title);
                  }
              }
              
-             // Priority C: Document Titles
-             if (!answer) {
-                 const titles = response.results
-                    .map(r => smartUnwrap(r.document.derivedStructData).title)
-                    .filter(t => t)
-                    .slice(0, 3);
-                 
-                 if (titles.length > 0) {
-                     answer = `I found these documents matching your query:\n• ${titles.join("\n• ")}\n\nPlease download them below.`;
-                 }
+             // Construct the answer
+             if (foundTitles.length > 0) {
+                 answer = `I found the following matching documents:\n• ${foundTitles.join("\n• ")}`;
+             } else {
+                 answer = "I found some files, but they don't have clear titles. Please check the links below.";
              }
         } 
         
         if (!answer) {
-            answer = "I searched the database, but couldn't find a direct match. Try searching for a simpler term like 'Letter' or 'Template'.";
-        }
-
-        // 4. LINKS
-        const links = [];
-        if (response.results) {
-            response.results.forEach(result => {
-                const data = smartUnwrap(result.document.derivedStructData);
-                if (data.link) {
-                    links.push({ 
-                        title: data.title || "Download Document", 
-                        url: fixLink(data.link) 
-                    });
-                }
-            });
+            answer = "I searched the database but didn't find any matching documents. Try searching for a specific filename.";
         }
 
         res.json({ answer, links });
 
     } catch (error) {
         console.error("Backend Error:", error);
-        res.status(500).json({ answer: "I'm having trouble connecting. Please try again.", error: error.message });
+        res.status(500).json({ answer: "Connection error.", error: error.message });
     }
 });
 

@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
-const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
+// IMPORT BOTH CLIENTS: One for searching, one for checking settings
+const { SearchServiceClient, ServingConfigServiceClient } = require("@google-cloud/discoveryengine").v1beta;
 
 const app = express();
 app.use(express.json());
@@ -11,12 +12,11 @@ app.use(cors({ origin: "*" }));
 const PROJECT = "28062079972"; 
 const LOCATION = "global";
 const COLLECTION_ID = "default_collection";
-// This is the Data Store ID confirmed by your screenshots
 const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
 // ---------------------
 
-// Helper to get authorized client
-function getClient() {
+// Helper for Credentials
+function getCredentials() {
     if (!process.env.GOOGLE_JSON_KEY) {
         throw new Error("Missing GOOGLE_JSON_KEY env var");
     }
@@ -24,58 +24,31 @@ function getClient() {
     if (credentials.private_key) {
         credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
     }
-    return new SearchServiceClient({ credentials });
-}
-
-function fixLink(link) {
-    if (!link) return "#";
-    if (link.startsWith("gs://")) {
-        return "https://storage.googleapis.com/" + link.substring(5);
-    }
-    return link;
-}
-
-function smartUnwrap(data) {
-    if (!data) return null;
-    if (data.fields) {
-        const result = {};
-        for (const key in data.fields) {
-            result[key] = unwrapValue(data.fields[key]);
-        }
-        return result;
-    }
-    return data;
-}
-
-function unwrapValue(value) {
-    if (!value) return null;
-    if (value.stringValue !== undefined) return value.stringValue;
-    if (value.structValue) return smartUnwrap(value.structValue);
-    if (value.listValue) return value.listValue.values.map(unwrapValue);
-    return value; 
+    return credentials;
 }
 
 app.get("/", (req, res) => res.send("Backend is running!"));
 
-// --- NEW DIAGNOSTIC ENDPOINT (From ChatGPT's Strategy) ---
+// --- FIXED DIAGNOSTIC ENDPOINT ---
 app.get("/configs", async (req, res) => {
     try {
-        const client = getClient();
+        const credentials = getCredentials();
+        // USE THE CORRECT CLIENT FOR LISTING CONFIGS
+        const configClient = new ServingConfigServiceClient({ credentials });
+        
         const parent = `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}`;
         
         console.log(`Listing configs for: ${parent}`);
         
-        // Ask Google what serving configs exist
-        const [configs] = await client.listServingConfigs({ parent });
+        const [configs] = await configClient.listServingConfigs({ parent });
 
         res.json({
             parent,
             count: configs.length,
             configs: configs.map(c => ({
-                name: c.name, // The full path we need
+                name: c.name, 
                 displayName: c.displayName,
-                // We also check the state to see if it's actually active
-                mediaState: c.mediaState 
+                state: c.mediaState // Checks if it's active
             }))
         });
     } catch (e) {
@@ -84,16 +57,17 @@ app.get("/configs", async (req, res) => {
     }
 });
 
-// --- CHAT ENDPOINT ---
+// --- SEARCH ENDPOINT ---
 app.post("/chat", async (req, res) => {
     try {
         const userQuery = req.body.query;
         console.log("------------------------------------------------");
         console.log("User asked:", userQuery);
 
-        const client = getClient();
+        const credentials = getCredentials();
+        const client = new SearchServiceClient({ credentials });
 
-        // We currently guess "default_search" - the /configs endpoint will tell us if this is right.
+        // We are temporarily guessing 'default_search' until you run /configs
         const servingConfig = `projects/${PROJECT}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
 
         console.log("Connecting to:", servingConfig); 
@@ -112,36 +86,32 @@ app.post("/chat", async (req, res) => {
         let answer = "";
         const links = [];
 
-        if (response.summary && response.summary.summaryText) {
-            answer = response.summary.summaryText;
-        }
-
         if (response.results && response.results.length > 0) {
              const foundTitles = [];
              for (const result of response.results) {
-                 const data = smartUnwrap(result.document.derivedStructData);
+                 const data = result.document.derivedStructData;
                  
-                 if (data.link) {
-                     links.push({ 
-                         title: data.title || "View Document", 
-                         url: fixLink(data.link) 
-                     });
+                 // Handle nested 'fields' structure if Google wraps it
+                 const fields = data.fields ? unwrapFields(data.fields) : data;
+
+                 if (fields.link) {
+                     let url = fields.link;
+                     if (url.startsWith("gs://")) {
+                         url = "https://storage.googleapis.com/" + url.substring(5);
+                     }
+                     links.push({ title: fields.title || "Document", url });
                  }
-                 if (data.title) foundTitles.push(data.title);
+                 if (fields.title) foundTitles.push(fields.title);
              }
 
-             if (!answer) {
-                 if (foundTitles.length > 0) {
-                     answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
-                 } else {
-                     answer = "I found some relevant files. Please check the links below.";
-                 }
+             if (foundTitles.length > 0) {
+                 answer = `I found these documents:\n• ${foundTitles.join("\n• ")}`;
+             } else {
+                 answer = "I found relevant files. Check the links below.";
              }
         } 
         
-        if (!answer) {
-            answer = "I searched the database but couldn't find a direct match. Try searching for a specific filename.";
-        }
+        if (!answer) answer = "No matching documents found.";
 
         res.json({ answer, links });
 
@@ -150,6 +120,16 @@ app.post("/chat", async (req, res) => {
         res.status(500).json({ answer: "Connection error.", error: error.message });
     }
 });
+
+// Helper to unwrap Google's messy JSON if needed
+function unwrapFields(fields) {
+    const result = {};
+    for (const key in fields) {
+        const val = fields[key];
+        result[key] = val.stringValue || val;
+    }
+    return result;
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

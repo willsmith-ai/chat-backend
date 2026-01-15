@@ -11,12 +11,12 @@ app.use(cors({
 
 // --- CONFIGURATION ---
 const PROJECT_ID = "groovy-root-483105-n9"; 
-const APP_ID = "claretycoreai_1767340856472"; 
+// We are switching back to the DATA STORE ID (The "Library")
+const DATA_STORE_ID = "claretycoreai_1767340742213"; 
 const LOCATION = "global"; 
 // ---------------------
 
 // --- HELPER: DATA CLEANER ---
-// Turns Google's messy "fields" and "stringValue" into normal JSON
 function smartUnwrap(data) {
     if (!data) return null;
     if (data.fields) {
@@ -26,7 +26,7 @@ function smartUnwrap(data) {
         }
         return result;
     }
-    return data; // It was already clean
+    return data;
 }
 
 function unwrapValue(value) {
@@ -40,13 +40,11 @@ function unwrapValue(value) {
 // --- HELPER: LINK FIXER ---
 function fixLink(link) {
     if (!link) return "#";
-    // Convert Google Storage links (gs://) to Downloadable Links (https://)
     if (link.startsWith("gs://")) {
         return "https://storage.googleapis.com/" + link.substring(5);
     }
     return link;
 }
-// ------------------------------
 
 app.get("/", (req, res) => {
     res.send("Backend is running!");
@@ -61,7 +59,7 @@ app.post("/chat", async (req, res) => {
         // 1. PERSONALITY LAYER
         const lowerQ = userQuery.toLowerCase();
         if (lowerQ.match(/^(hi|hello|hey|greetings)/)) {
-            return res.json({ answer: "Hello! I am connected to the Clarety Knowledge Database. Try asking for 'Contact Change Logs' or 'Email Templates'.", links: [] });
+            return res.json({ answer: "Hello! I am connected to the Clarety Knowledge Database. Try searching for 'Contact Change Log'.", links: [] });
         }
 
         // 2. CONNECT TO GOOGLE
@@ -71,38 +69,35 @@ app.post("/chat", async (req, res) => {
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
         const client = new SearchServiceClient({ credentials });
 
-        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/engines/${APP_ID}/servingConfigs/default_search`;
+        // NOTICE: We switched from 'engines' back to 'dataStores'
+        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
 
-        // We removed 'extractiveContentSpec' to make the search faster and broader
         const request = {
             servingConfig: servingConfig,
             query: userQuery,
             pageSize: 5,
             contentSearchSpec: {
-                summarySpec: { summaryResultCount: 5, ignoreAdversarialQuery: true },
+                summarySpec: { 
+                    summaryResultCount: 5, 
+                    ignoreAdversarialQuery: true,
+                    includeCitations: true
+                },
                 snippetSpec: { returnSnippet: true }
             }
         };
 
         const [response] = await client.search(request, { autoPaginate: false });
         
-        // --- DEBUG LOGGING (Check Render Logs if it fails!) ---
         console.log(`Found ${response.results ? response.results.length : 0} results.`);
-        if (response.results && response.results.length > 0) {
-            const firstTitle = smartUnwrap(response.results[0].document.derivedStructData).title;
-            console.log("Top Result Title:", firstTitle);
-        }
-        // -----------------------------------------------------
 
-        // 3. SMART ANSWER LOGIC
+        // 3. ANSWER LOGIC
         let answer = "";
         
         // Priority A: AI Summary
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         } 
-        
-        // Priority B: Snippets
+        // Priority B: Snippets from the Data Store
         else if (response.results && response.results.length > 0) {
              for (const result of response.results) {
                  const data = smartUnwrap(result.document.derivedStructData);
@@ -117,7 +112,7 @@ app.post("/chat", async (req, res) => {
                  }
              }
              
-             // Priority C: Force Title Match (The "Prove it" fallback)
+             // Priority C: Force Title Match
              if (!answer) {
                  const titles = response.results
                     .map(r => smartUnwrap(r.document.derivedStructData).title)
@@ -125,14 +120,13 @@ app.post("/chat", async (req, res) => {
                     .slice(0, 3);
                  
                  if (titles.length > 0) {
-                     answer = `I found these documents in the database that match your query:\n• ${titles.join("\n• ")}\n\nPlease open them below to read the full content.`;
+                     answer = `I found these documents matching your query:\n• ${titles.join("\n• ")}\n\nPlease download them below to read more.`;
                  }
              }
         } 
         
-        // Default Failure Message
         if (!answer) {
-            answer = "I searched the database, but I couldn't find a document that matches those keywords. Try searching for the exact document title (e.g., 'Contact Change Log').";
+            answer = "I searched the database, but couldn't find a direct match. Try searching for a simpler term like 'Letter' or 'Template'.";
         }
 
         // 4. LINKS

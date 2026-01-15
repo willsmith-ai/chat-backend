@@ -5,7 +5,6 @@ const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
 const app = express();
 app.use(express.json());
 
-// Enable CORS
 app.use(cors({
     origin: "*" 
 }));
@@ -16,6 +15,27 @@ const APP_ID = "claretycoreai_1767340856472";
 const LOCATION = "global"; 
 // ---------------------
 
+// --- HELPER: UNWRAP GOOGLE DATA ---
+// This function digs through the messy "fields" and "stringValue" layers
+// to find the actual text, no matter how Google sends it.
+function unwrap(value) {
+    if (!value) return null;
+    if (value.stringValue) return value.stringValue;
+    if (value.structValue) return unwrapStruct(value.structValue);
+    if (value.listValue) return value.listValue.values.map(unwrap);
+    return value; // Return as-is if it's already simple
+}
+
+function unwrapStruct(struct) {
+    if (!struct || !struct.fields) return {};
+    const result = {};
+    for (const key in struct.fields) {
+        result[key] = unwrap(struct.fields[key]);
+    }
+    return result;
+}
+// ----------------------------------
+
 app.get("/", (req, res) => {
     res.send("Backend is running!");
 });
@@ -25,9 +45,8 @@ app.post("/chat", async (req, res) => {
         const userQuery = req.body.query;
         console.log("User asked:", userQuery);
 
-        // --- 1. HUMAN LAYER: GREETINGS ---
+        // --- 1. GREETINGS ---
         const greetings = ["hi", "hello", "hey", "greetings", "good morning", "good afternoon"];
-        // Clean up the input (remove punctuation, make lowercase)
         const cleanQuery = userQuery.toLowerCase().trim().replace(/[!.,?]/g, "");
 
         if (greetings.includes(cleanQuery)) {
@@ -37,7 +56,7 @@ app.post("/chat", async (req, res) => {
             });
         }
 
-        // --- 2. CONNECT TO GOOGLE ---
+        // --- 2. GOOGLE SEARCH ---
         if (!process.env.GOOGLE_JSON_KEY) {
             throw new Error("Missing Google Credentials");
         }
@@ -49,7 +68,7 @@ app.post("/chat", async (req, res) => {
         const request = {
             servingConfig: servingConfig,
             query: userQuery,
-            pageSize: 5, // Fetch a few more to increase chances of finding a good snippet
+            pageSize: 5,
             contentSearchSpec: {
                 summarySpec: {
                     summaryResultCount: 5,
@@ -62,48 +81,57 @@ app.post("/chat", async (req, res) => {
             }
         };
 
-        const [response] = await client.search(request);
+        // We add { autoPaginate: false } to stop the logs from complaining
+        const [response] = await client.search(request, { autoPaginate: false });
         
         // --- 3. SMART ANSWER LOGIC ---
         let answer = "I checked my documents, but I couldn't find specific information about that. Could you try rephrasing your question?";
         
-        // A. Try to get the fancy AI Summary first
+        // A. Check for AI Summary
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         } 
-        // B. Fallback: Search for the first *valid* text snippet
+        // B. Fallback: Dig through results using the UNWRAPPER
         else if (response.results && response.results.length > 0) {
              
-             for (const result of response.results) {
-                 const data = result.document.derivedStructData;
-                 if (!data) continue;
+             let foundGoodSnippet = false;
 
-                 // Check for Extractive Answers (Best quality)
-                 if (data.extractive_answers && data.extractive_answers.length > 0) {
-                     answer = data.extractive_answers[0].content;
-                     break; // Found a good one, stop looking
-                 }
+             for (const result of response.results) {
+                 // Use our helper to clean the data!
+                 const data = unwrapStruct(result.document.derivedStructData);
                  
-                 // Check for Snippets (Standard quality)
-                 if (data.snippets && data.snippets.length > 0) {
+                 // Now 'data' is clean! We can use data.snippets, data.title, etc.
+
+                 // Check Snippets
+                 if (data.snippets && Array.isArray(data.snippets) && data.snippets.length > 0) {
                      let snippetText = data.snippets[0].snippet;
                      
-                     // CRITICAL FIX: Ignore useless "No snippet" messages
+                     // Filter out the "No snippet" junk
                      if (snippetText && !snippetText.includes("No snippet is available")) {
-                         // Clean up HTML tags (remove <b>, </b>, etc.)
+                         // Clean up HTML tags
                          answer = "I found this in the documents: " + snippetText.replace(/<[^>]*>/g, "");
-                         break; // Found a good one, stop looking
+                         foundGoodSnippet = true;
+                         break;
                      }
+                 }
+             }
+
+             // Loop 2: If no text found, use the Title
+             if (!foundGoodSnippet) {
+                 // Unwrap the first document to get the title
+                 const firstData = unwrapStruct(response.results[0].document.derivedStructData);
+                 if (firstData.title) {
+                     answer = `I found a document named "${firstData.title}" that seems relevant. You can open it below to read more.`;
                  }
              }
         }
 
-        // C. Extract Links
+        // --- 4. LINKS ---
         const links = [];
         if (response.results) {
             response.results.forEach(result => {
-                const data = result.document.derivedStructData;
-                if (data && data.link) {
+                const data = unwrapStruct(result.document.derivedStructData);
+                if (data.link) {
                     links.push({ title: data.title || "Link", url: data.link });
                 }
             });

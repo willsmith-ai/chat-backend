@@ -4,19 +4,15 @@ const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
 
 const app = express();
 app.use(express.json());
-
 app.use(cors({ origin: "*" }));
 
-// --- CONFIGURATION ---
-// 1. PROJECT ID: STRING (Matches the Preview URL)
+// --- CONFIGURATION (Confimed by your Screenshots) ---
 const PROJECT_ID = "groovy-root-483105-n9"; 
 const LOCATION = "global"; 
 const COLLECTION_ID = "default_collection";
-
-// 2. TARGET: ENGINE (Matches the Preview Context)
 const ENGINE_ID = "claretycoreai_1767340856472"; 
 const SERVING_CONFIG_ID = "default_search";
-// ---------------------
+// ----------------------------------------------------
 
 function fixLink(link) {
     if (!link) return "#";
@@ -24,15 +20,6 @@ function fixLink(link) {
         return "https://storage.googleapis.com/" + link.substring(5);
     }
     return link;
-}
-
-function unwrapFields(fields) {
-    const result = {};
-    for (const key in fields) {
-        const val = fields[key];
-        result[key] = val.stringValue || val;
-    }
-    return result;
 }
 
 app.get("/", (req, res) => res.send("Backend is running!"));
@@ -52,22 +39,26 @@ app.post("/chat", async (req, res) => {
         }
         const client = new SearchServiceClient({ credentials });
 
-        // --- PATH CONSTRUCTION ---
-        // We are using the ENGINE path because the Preview works there.
+        // --- PATH: ENGINE PATH (Confirmed by your /configs test) ---
         const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/${COLLECTION_ID}/engines/${ENGINE_ID}/servingConfigs/${SERVING_CONFIG_ID}`;
-
         console.log("Connecting to:", servingConfig); 
 
         const request = {
             servingConfig: servingConfig,
             query: userQuery,
             pageSize: 5,
-            // We enable Summaries because your screenshot shows the Preview generating one.
+            // --- THE FIX: Force Extractive Segments & Summaries ---
+            // This mimics the "Question Answering" behavior of the Preview window
             contentSearchSpec: { 
                 snippetSpec: { returnSnippet: true },
-                summarySpec: { summaryResultCount: 5, ignoreAdversarialQuery: true }
+                extractiveContentSpec: { maxExtractiveAnswerCount: 1 }, // "Find me the exact answer text"
+                summarySpec: { 
+                    summaryResultCount: 5, 
+                    includeCitations: true,
+                    ignoreAdversarialQuery: true 
+                }
             },
-            queryExpansionSpec: { condition: "AUTO" },
+            queryExpansionSpec: { condition: "AUTO" }, // Helps matches "log" to "logs"
             spellCorrectionSpec: { mode: "AUTO" }
         };
 
@@ -78,17 +69,30 @@ app.post("/chat", async (req, res) => {
         let answer = "";
         const links = [];
 
-        // 1. Check for AI Summary (This is what appears in your screenshot)
+        // 1. Check for AI Summary (Best Match)
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
         }
 
-        // 2. Check for Documents
+        // 2. Check for Extractive Answers (Direct Text from Doc)
+        if (!answer && response.results) {
+            for (const result of response.results) {
+                const data = result.document.derivedStructData;
+                // Check if Google pulled out a specific text segment
+                if (data.extractive_answers && data.extractive_answers.length > 0) {
+                    answer = data.extractive_answers[0].content;
+                    break;
+                }
+            }
+        }
+
+        // 3. Process Links
         if (response.results && response.results.length > 0) {
              const foundTitles = [];
-             
              for (const result of response.results) {
                  const data = result.document.derivedStructData;
+                 
+                 // Handle Google's varying JSON structure
                  const fields = data.fields ? unwrapFields(data.fields) : data;
 
                  if (fields.link) {
@@ -104,7 +108,7 @@ app.post("/chat", async (req, res) => {
                  if (foundTitles.length > 0) {
                      answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
                  } else {
-                     answer = "I found some relevant files. Please check the links below.";
+                     answer = "I found relevant files. Check the links below.";
                  }
              }
         } 
@@ -117,10 +121,19 @@ app.post("/chat", async (req, res) => {
 
     } catch (error) {
         console.error("Backend Error:", error);
-        // Important: Log the specific error code to see if we hit INVALID_ARGUMENT again
-        res.status(500).json({ answer: "I'm having trouble connecting.", error: error.message });
+        res.status(500).json({ answer: "Connection error.", error: error.message });
     }
 });
+
+// Helper to unwrap fields cleanly
+function unwrapFields(fields) {
+    const result = {};
+    for (const key in fields) {
+        const val = fields[key];
+        result[key] = val.stringValue || val;
+    }
+    return result;
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

@@ -12,7 +12,6 @@ app.use(cors({
 
 // --- CONFIGURATION ---
 const PROJECT_ID = "groovy-root-483105-n9"; 
-// I switched this to your "ClaretyCoreAI" ID which has the data:
 const APP_ID = "claretycoreai_1767340856472"; 
 const LOCATION = "global"; 
 // ---------------------
@@ -32,9 +31,6 @@ app.post("/chat", async (req, res) => {
 
         console.log("Searching for:", userQuery);
 
-        // --- THE FIX ---
-        // 1. We use 'engines' (because it's a Search App).
-        // 2. We use the APP_ID (ClaretyCoreAI) we defined above.
         const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/default_collection/engines/${APP_ID}/servingConfigs/default_search`;
 
         const request = {
@@ -44,16 +40,40 @@ app.post("/chat", async (req, res) => {
             contentSearchSpec: {
                 summarySpec: {
                     summaryResultCount: 5,
-                    includeCitations: true
+                    includeCitations: true,
+                    ignoreAdversarialQuery: true // helps with "safe" queries
+                },
+                snippetSpec: {
+                    returnSnippet: true // Ensure we get text snippets
                 }
             }
         };
 
         const [response] = await client.search(request);
+        
+        // LOGGING: This will print the raw Google response to your Render logs.
+        // If it still fails, checking this log will tell us WHY.
+        console.log("Google Response:", JSON.stringify(response, null, 2));
 
+        // --- SMART ANSWER LOGIC ---
         let answer = "I couldn't find an answer in the documents.";
+        
+        // 1. Try to get the fancy AI Summary
         if (response.summary && response.summary.summaryText) {
             answer = response.summary.summaryText;
+        } 
+        // 2. Fallback: If no summary, grab the text snippet from the first result
+        else if (response.results && response.results.length > 0) {
+             const firstDoc = response.results[0];
+             // Try to find a text snippet in the document data
+             if (firstDoc.document && firstDoc.document.derivedStructData) {
+                 const data = firstDoc.document.derivedStructData;
+                 if (data.snippets && data.snippets.length > 0) {
+                     answer = "I didn't generate a summary, but here is what I found: " + data.snippets[0].snippet;
+                 } else if (data.extractive_answers && data.extractive_answers.length > 0) {
+                      answer = "Result: " + data.extractive_answers[0].content;
+                 }
+             }
         }
 
         const links = [];

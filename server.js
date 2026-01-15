@@ -9,16 +9,16 @@ app.use(cors({
     origin: "*" 
 }));
 
-// --- CONFIGURATION ---
-const PROJECT_NUMBER = "28062079972"; 
+// --- CONFIGURATION (Based on your Screenshots & ChatGPT's Audit) ---
+const PROJECT_ID = "groovy-root-483105-n9"; 
 const LOCATION = "global"; 
 
-// CHATGPT FIX: We are swapping 'default_collection' for your specific Collection ID
+// 1. The Collection ID from your console (NOT 'default_collection')
 const COLLECTION_ID = "claretycoreai_1767340742213"; 
 
-// THE DATA STORE ID (The specific folder with your files)
-const DATA_STORE_ID = "claretycoreai_1767340742213_gcs_store"; 
-// ---------------------
+// 2. The Engine ID (The "Brain" App)
+const ENGINE_ID = "claretycoreai_1767340856472"; 
+// ------------------------------------------------------------------
 
 // --- HELPER: DATA CLEANER ---
 function smartUnwrap(data) {
@@ -73,11 +73,11 @@ app.post("/chat", async (req, res) => {
         const credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
         const client = new SearchServiceClient({ credentials });
 
-        // --- PATH CONSTRUCTION ---
-        // We use the specific COLLECTION_ID here as suggested
-        const servingConfig = `projects/${PROJECT_NUMBER}/locations/${LOCATION}/collections/${COLLECTION_ID}/dataStores/${DATA_STORE_ID}/servingConfigs/default_search`;
+        // --- PATH CONSTRUCTION (The Fix) ---
+        // We use the specific COLLECTION_ID and the ENGINE_ID
+        const servingConfig = `projects/${PROJECT_ID}/locations/${LOCATION}/collections/${COLLECTION_ID}/engines/${ENGINE_ID}/servingConfigs/default_search`;
 
-        console.log("Connecting to:", servingConfig); // DEBUG PRINT
+        console.log("Connecting to:", servingConfig); 
 
         const request = {
             servingConfig: servingConfig,
@@ -102,7 +102,7 @@ app.post("/chat", async (req, res) => {
             answer = response.summary.summaryText;
         }
 
-        // Process Results
+        // Process Results (Fallback if no summary)
         if (response.results && response.results.length > 0) {
              const foundTitles = [];
              let bestSnippet = "";
@@ -110,7 +110,6 @@ app.post("/chat", async (req, res) => {
              for (const result of response.results) {
                  const data = smartUnwrap(result.document.derivedStructData);
                  
-                 // Collect Link
                  if (data.link) {
                      links.push({ 
                          title: data.title || "View Document", 
@@ -118,12 +117,8 @@ app.post("/chat", async (req, res) => {
                      });
                  }
 
-                 // Collect Title
-                 if (data.title) {
-                     foundTitles.push(data.title);
-                 }
+                 if (data.title) foundTitles.push(data.title);
 
-                 // Collect Snippet
                  if (!answer && !bestSnippet && data.snippets && data.snippets.length > 0) {
                      let text = data.snippets[0].snippet;
                      if (text && !text.includes("No snippet is available")) {
@@ -132,12 +127,11 @@ app.post("/chat", async (req, res) => {
                  }
              }
 
-             // Construct Answer
              if (!answer) {
                  if (bestSnippet) {
-                     answer = `Here is what I found in the documents:\n"${bestSnippet}"`;
+                     answer = `Here is what I found:\n"${bestSnippet}"`;
                  } else if (foundTitles.length > 0) {
-                     answer = `I found these matching documents:\n• ${foundTitles.join("\n• ")}`;
+                     answer = `I found these documents matching your query:\n• ${foundTitles.join("\n• ")}`;
                  } else {
                      answer = "I found some relevant files. Please check the links below.";
                  }
@@ -145,7 +139,7 @@ app.post("/chat", async (req, res) => {
         } 
         
         if (!answer) {
-            answer = "I searched the database but couldn't find a direct match. Try searching for a specific filename like 'Contact Change Log'.";
+            answer = "I searched the database but couldn't find a direct match. Try searching for a specific filename.";
         }
 
         res.json({ answer, links });

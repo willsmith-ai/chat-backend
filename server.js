@@ -1,33 +1,33 @@
 /**
- * server.js — Clarety Core AI (Discovery Engine search + Vertex AI Gemini answer)
+ * Clarety Core AI - Render backend
  *
- * What this fixes:
- * 1) Discovery Engine search uses your service account JSON (GOOGLE_JSON_KEY)
- * 2) Vertex AI (Gemini) ALSO uses the same service account JSON (NO ADC / no gcloud login)
+ * What it does:
+ * 1) Calls Discovery Engine REST Search (same as Cloud Shell curl) using a service-account minted access token
+ * 2) Calls Vertex AI Gemini REST generateContent using the same token
+ * 3) Returns { answer, links, debug }
  *
- * Required Render env vars:
- * - GOOGLE_JSON_KEY      = full service account JSON (single-line is fine)
- * - DE_PROJECT_NUMBER    = 28062079972
- * - DE_LOCATION          = global
- * - DE_COLLECTION_ID     = default_collection
- * - DE_ENGINE_ID         = claretycoreai_1767340856472
+ * Required env vars:
+ * - GOOGLE_JSON_KEY           = service account JSON (as ONE LINE string)
  *
- * - VERTEX_PROJECT_ID    = groovy-root-483105-n9   (project *id* where Vertex AI is enabled)
- * - VERTEX_LOCATION      = us-central1             (recommended)
- * - GEMINI_MODEL         = gemini-1.5-flash        (or gemini-1.5-pro)
+ * Discovery Engine (from your Integration → API screen):
+ * - DE_PROJECT_NUMBER         = 28062079972
+ * - DE_LOCATION               = global
+ * - DE_COLLECTION_ID          = default_collection
+ * - DE_ENGINE_ID              = claretycoreai_1767340856472
+ * - DE_SERVING_CONFIG_ID      = default_search
+ *
+ * Vertex / Gemini:
+ * - VERTEX_PROJECT_ID         = groovy-root-483105-n9
+ * - VERTEX_LOCATION           = us-central1
+ * - GEMINI_MODEL              = gemini-1.5-flash   (or gemini-1.5-pro)
  *
  * Optional:
- * - ALLOWED_ORIGIN       = https://willsmith-ai.github.io   (or "*" for testing)
- * - TEST_USER_EMAIL      = anything@example.com (for debugging only)
+ * - ALLOWED_ORIGIN            = https://willsmith-ai.github.io  (or "*" for testing)
  */
-
-"use strict";
 
 const express = require("express");
 const cors = require("cors");
-
-const { SearchServiceClient } = require("@google-cloud/discoveryengine").v1beta;
-const { VertexAI } = require("@google-cloud/vertexai");
+const { GoogleAuth } = require("google-auth-library");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -38,264 +38,268 @@ app.use(
   })
 );
 
-// -------------------------
-// Helpers
-// -------------------------
-function getCredentials() {
-  if (!process.env.GOOGLE_JSON_KEY) {
-    throw new Error("Missing GOOGLE_JSON_KEY env var");
-  }
+// ----------------------- Helpers -----------------------
 
-  let credentials;
-  try {
-    credentials = JSON.parse(process.env.GOOGLE_JSON_KEY);
-  } catch (e) {
-    throw new Error(
-      "GOOGLE_JSON_KEY is not valid JSON. Paste the FULL service account JSON contents."
-    );
-  }
-
-  // Fix escaped newlines in private_key if stored as a single-line env var
-  if (credentials.private_key) {
-    credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
-  }
-
-  if (!credentials.client_email) {
-    throw new Error("The incoming JSON object does not contain a client_email field");
-  }
-
-  return credentials;
-}
-
-function requireEnv(name) {
+function mustGetEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
 
-function fixLink(link) {
+function getServiceAccountCredentials() {
+  const raw = mustGetEnv("GOOGLE_JSON_KEY");
+
+  // The value in Render is usually pasted as a single line JSON string.
+  // If private_key contains "\\n", convert to real newlines.
+  const creds = JSON.parse(raw);
+  if (creds.private_key) {
+    creds.private_key = creds.private_key.replace(/\\n/g, "\n");
+  }
+
+  // Hard validation: this is exactly the error you saw.
+  if (!creds.client_email) {
+    throw new Error("GOOGLE_JSON_KEY JSON is missing client_email (wrong JSON pasted).");
+  }
+  if (!creds.private_key) {
+    throw new Error("GOOGLE_JSON_KEY JSON is missing private_key (wrong JSON pasted).");
+  }
+  return creds;
+}
+
+async function getAccessToken() {
+  const credentials = getServiceAccountCredentials();
+
+  const auth = new GoogleAuth({
+    credentials,
+    // Cloud Platform scope covers both Discovery Engine + Vertex AI
+    scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+  });
+
+  const client = await auth.getClient();
+  const tokenResponse = await client.getAccessToken();
+
+  const token = tokenResponse && tokenResponse.token ? tokenResponse.token : tokenResponse;
+  if (!token) throw new Error("Failed to mint access token from service account credentials.");
+  return token;
+}
+
+function fixGsLink(link) {
   if (!link) return null;
   if (link.startsWith("gs://")) return "https://storage.googleapis.com/" + link.substring(5);
   return link;
 }
 
-// Unwrap derivedStructData from proto-ish structs (works for node client responses)
-function smartUnwrap(data) {
-  if (!data) return null;
-  if (data.fields) {
-    const out = {};
-    for (const k of Object.keys(data.fields)) out[k] = unwrapValue(data.fields[k]);
-    return out;
-  }
-  return data;
-}
-function unwrapValue(v) {
-  if (!v) return null;
-  if (v.stringValue !== undefined) return v.stringValue;
-  if (v.numberValue !== undefined) return v.numberValue;
-  if (v.boolValue !== undefined) return v.boolValue;
-  if (v.structValue) return smartUnwrap(v.structValue);
-  if (v.listValue?.values) return v.listValue.values.map(unwrapValue);
-  return v;
-}
-
 function stripHtml(s) {
-  return (s || "").replace(/<[^>]*>/g, "");
+  if (!s) return "";
+  return String(s).replace(/<[^>]*>/g, "");
 }
 
-// -------------------------
-// Config (from env)
-// -------------------------
-function getDeServingConfig() {
-  const DE_PROJECT_NUMBER = requireEnv("DE_PROJECT_NUMBER"); // numeric
-  const DE_LOCATION = requireEnv("DE_LOCATION"); // global
-  const DE_COLLECTION_ID = requireEnv("DE_COLLECTION_ID"); // default_collection
-  const DE_ENGINE_ID = requireEnv("DE_ENGINE_ID"); // your engine id
+// ----------------------- Discovery Engine Search (REST) -----------------------
 
-  return `projects/${DE_PROJECT_NUMBER}/locations/${DE_LOCATION}/collections/${DE_COLLECTION_ID}/engines/${DE_ENGINE_ID}/servingConfigs/default_search`;
-}
+async function discoverySearch({ token, query, pageSize = 10 }) {
+  const DE_PROJECT_NUMBER = mustGetEnv("DE_PROJECT_NUMBER");
+  const DE_LOCATION = mustGetEnv("DE_LOCATION");
+  const DE_COLLECTION_ID = mustGetEnv("DE_COLLECTION_ID");
+  const DE_ENGINE_ID = mustGetEnv("DE_ENGINE_ID");
+  const DE_SERVING_CONFIG_ID = mustGetEnv("DE_SERVING_CONFIG_ID");
 
-function getVertexConfig() {
+  // This matches the Integration → API page
+  const url =
+    `https://discoveryengine.googleapis.com/v1alpha/` +
+    `projects/${DE_PROJECT_NUMBER}/locations/${DE_LOCATION}` +
+    `/collections/${DE_COLLECTION_ID}/engines/${DE_ENGINE_ID}` +
+    `/servingConfigs/${DE_SERVING_CONFIG_ID}:search`;
+
+  const body = {
+    query,
+    pageSize,
+    queryExpansionSpec: { condition: "AUTO" },
+    spellCorrectionSpec: { mode: "AUTO" },
+    languageCode: "en-US",
+    userInfo: { timeZone: "Asia/Saigon" },
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await resp.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`Discovery Engine returned non-JSON. Status ${resp.status}. Body: ${text}`);
+  }
+
+  if (!resp.ok) {
+    const msg = json.error?.message || json.message || JSON.stringify(json);
+    throw new Error(`Discovery Engine search failed (${resp.status}): ${msg}`);
+  }
+
+  const results = Array.isArray(json.results) ? json.results : [];
+  const totalSize = typeof json.totalSize === "number" ? json.totalSize : results.length;
+
+  // Extract what we need
+  const items = results.map((r) => {
+    const d = r.document || {};
+    const ds = d.derivedStructData || {};
+    const title = ds.title || d.id || r.id || "Untitled";
+    const link = fixGsLink(ds.link);
+    const extractiveAnswers = Array.isArray(ds.extractive_answers)
+      ? ds.extractive_answers.map((a) => stripHtml(a.content || "")).filter(Boolean)
+      : [];
+
+    return { title, link, extractiveAnswers };
+  });
+
   return {
-    project: requireEnv("VERTEX_PROJECT_ID"),
-    location: requireEnv("VERTEX_LOCATION"),
-    model: process.env.GEMINI_MODEL || "gemini-1.5-flash",
+    urlUsed: url,
+    totalSize,
+    items,
+    raw: json,
   };
 }
 
-// -------------------------
-// Clients (created per request to keep it simple and avoid stale env issues)
-// -------------------------
-function makeDiscoveryEngineClient(credentials) {
-  return new SearchServiceClient({ credentials });
-}
+// ----------------------- Vertex AI Gemini (REST) -----------------------
 
-function makeVertexClient(credentials) {
-  const { project, location } = getVertexConfig();
+async function geminiGenerate({ token, userQuery, groundingItems }) {
+  const VERTEX_PROJECT_ID = mustGetEnv("VERTEX_PROJECT_ID");
+  const VERTEX_LOCATION = mustGetEnv("VERTEX_LOCATION");
+  const GEMINI_MODEL = mustGetEnv("GEMINI_MODEL");
 
-  // ✅ THIS IS THE KEY FIX:
-  // We pass explicit credentials to VertexAI so it DOES NOT try ADC.
-  return new VertexAI({
-    project,
-    location,
-    googleAuthOptions: { credentials },
+  const url =
+    `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/` +
+    `projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}` +
+    `/publishers/google/models/${GEMINI_MODEL}:generateContent`;
+
+  // Build a grounded context block from search results
+  const top = groundingItems.slice(0, 6);
+  const contextLines = top.map((it, i) => {
+    const citation = it.link ? `Source: ${it.link}` : "Source: (no link)";
+    const bestSnippet = it.extractiveAnswers && it.extractiveAnswers.length > 0 ? it.extractiveAnswers[0] : "";
+    return `[${i + 1}] ${it.title}\n${citation}\nSnippet: ${bestSnippet}`;
   });
+
+  const systemInstruction =
+    `You are Clarety Core AI. Answer using the provided sources first. ` +
+    `If the question is Vietnamese, respond in Vietnamese. If English, respond in English. ` +
+    `If sources are insufficient, say so and ask a clarifying question. ` +
+    `Keep it concise and practical.`;
+
+  const prompt =
+    `User question:\n${userQuery}\n\n` +
+    `Sources (search results):\n${contextLines.join("\n\n")}\n\n` +
+    `Task:\n- Provide a helpful answer.\n- If you used a source, mention it as [1], [2], etc.\n`;
+
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: prompt }],
+      },
+    ],
+    systemInstruction: {
+      parts: [{ text: systemInstruction }],
+    },
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 600,
+    },
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await resp.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`Gemini returned non-JSON. Status ${resp.status}. Body: ${text}`);
+  }
+
+  if (!resp.ok) {
+    const msg = json.error?.message || json.message || JSON.stringify(json);
+    throw new Error(`Gemini generateContent failed (${resp.status}): ${msg}`);
+  }
+
+  const candidate = json.candidates && json.candidates[0];
+  const parts = candidate?.content?.parts || [];
+  const answer = parts.map((p) => p.text || "").join("").trim();
+
+  return { urlUsed: url, answer, raw: json };
 }
 
-// -------------------------
-// Routes
-// -------------------------
+// ----------------------- Routes -----------------------
+
 app.get("/", (req, res) => {
   res.send("Backend is running!");
 });
 
-// Quick debug: confirm server sees env + which serving config it uses
-app.get("/debug-config", (req, res) => {
-  try {
-    const creds = getCredentials();
-    res.json({
-      ok: true,
-      deServingConfig: getDeServingConfig(),
-      vertex: getVertexConfig(),
-      serviceAccount: creds.client_email,
-      allowedOrigin: process.env.ALLOWED_ORIGIN || "*",
-      testUserEmail: process.env.TEST_USER_EMAIL || "[not set]",
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 app.post("/chat", async (req, res) => {
-  const userQuery = (req.body?.query || "").trim();
-
-  console.log("=================================");
-  console.log("CHAT REQUEST", { query: userQuery });
-  console.log("TEST_USER_EMAIL", process.env.TEST_USER_EMAIL ? "[set]" : "[not set]");
-  console.log("=================================");
-
-  if (!userQuery) return res.json({ answer: "Please type a question.", links: [] });
-
-  // Simple greeting shortcut
-  const lower = userQuery.toLowerCase();
-  if (/^(hi|hello|hey|greetings)\b/.test(lower)) {
-    return res.json({
-      answer: "Hello! I am connected to the Clarety Knowledge Database. Ask me anything.",
-      links: [],
-    });
-  }
-
   try {
-    // 1) Credentials
-    const credentials = getCredentials();
+    const query = (req.body && req.body.query ? String(req.body.query) : "").trim();
+    console.log("=================================");
+    console.log("CHAT REQUEST", { query });
+    console.log("=================================");
 
-    // 2) Discovery Engine search
-    const deClient = makeDiscoveryEngineClient(credentials);
-    const servingConfig = getDeServingConfig();
-
-    console.log("Using servingConfig:", servingConfig);
-
-    const request = {
-      servingConfig,
-      query: userQuery,
-      pageSize: 10,
-      queryExpansionSpec: { condition: "AUTO" },
-      spellCorrectionSpec: { mode: "AUTO" },
-      // Keep contentSearchSpec minimal; we rely on extractive_answers in derivedStructData
-      // contentSearchSpec: { snippetSpec: { returnSnippet: true } },
-    };
-
-    const [deResponse] = await deClient.search(request, { autoPaginate: false });
-
-    const results = deResponse.results || [];
-    console.log("Results:", results.length);
-
-    // Build citations/links + context for Gemini
-    const links = [];
-    const contextChunks = [];
-
-    for (const r of results) {
-      const derived = smartUnwrap(r.document?.derivedStructData);
-      if (!derived) continue;
-
-      const title = derived.title || "Source document";
-      const url = fixLink(derived.link);
-
-      if (url) links.push({ title, url });
-
-      // Prefer extractive_answers content if present
-      const answers = Array.isArray(derived.extractive_answers) ? derived.extractive_answers : [];
-      const extract = answers
-        .map((a) => stripHtml(a?.content || ""))
-        .filter(Boolean)
-        .slice(0, 2)
-        .join(" ");
-
-      if (extract) {
-        contextChunks.push(`Title: ${title}\nExtract: ${extract}\nSource: ${url || derived.link || ""}`);
-      } else {
-        // fallback: at least pass title
-        contextChunks.push(`Title: ${title}\nSource: ${url || derived.link || ""}`);
-      }
+    if (!query) {
+      return res.json({ answer: "Please type a question.", links: [] });
     }
 
-    // If no docs found, respond without calling Gemini (optional)
-    if (contextChunks.length === 0) {
+    // 1) Auth
+    const token = await getAccessToken();
+
+    // 2) Search
+    const search = await discoverySearch({ token, query, pageSize: 10 });
+    console.log("Using servingConfig:", search.urlUsed);
+    console.log("Results:", search.items.length);
+
+    const links = search.items
+      .filter((x) => x.link)
+      .slice(0, 6)
+      .map((x) => ({ title: x.title, url: x.link }));
+
+    // 3) If nothing found, return fast (still can do Gemini, but it would hallucinate)
+    if (search.items.length === 0) {
       return res.json({
-        answer: "No documents found. Try a different keyword (e.g., the exact document title).",
+        answer: "No documents found. Try a more specific keyword (e.g., the exact feature name).",
         links: [],
+        debug: { totalSize: search.totalSize },
       });
     }
 
-    // 3) Gemini answer using Vertex AI (authenticated via service account JSON)
-    const vertex = makeVertexClient(credentials);
-    const { model } = getVertexConfig();
+    // 4) Gemini answer grounded on the search results
+    const gen = await geminiGenerate({ token, userQuery: query, groundingItems: search.items });
 
-    const generativeModel = vertex.getGenerativeModel({
-      model,
-      generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens: 600,
+    return res.json({
+      answer: gen.answer || "I found documents, but I couldn’t generate an answer.",
+      links,
+      debug: {
+        totalSize: search.totalSize,
       },
     });
-
-    // Simple, grounded prompt: answer using provided context; keep it client-safe
-    const systemStyle = `
-You are Clarety Core AI. Answer clearly and helpfully.
-Use ONLY the provided context. If the context doesn't contain the answer, say so.
-If the user asks for a "how-to", give steps.
-If the user asks for translation, translate.
-Keep responses concise and client-safe.
-`;
-
-    const prompt = `
-${systemStyle}
-
-USER QUESTION:
-${userQuery}
-
-CONTEXT (top search extracts):
-${contextChunks.join("\n\n---\n\n")}
-`;
-
-    const geminiResp = await generativeModel.generateContent({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-    });
-
-    const answer =
-      geminiResp?.response?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ||
-      "I found documents, but couldn't generate an answer.";
-
-    return res.json({ answer, links });
-  } catch (error) {
-    console.error("CHAT ERROR:", error?.message || error);
-    res.status(500).json({
-      answer: "Backend error. Check server logs.",
-      error: error?.message || String(error),
+  } catch (err) {
+    console.error("CHAT ERROR:", err && err.message ? err.message : err);
+    return res.status(500).json({
+      answer: "Backend error. Check Render logs.",
+      error: err && err.message ? err.message : String(err),
     });
   }
 });
 
-// Render port binding
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});

@@ -12,6 +12,6 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "google-auth-library": "^9.14.1"
+    "google-auth-library": "^9.11.0"
   }
 }

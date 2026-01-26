@@ -1,16 +1,12 @@
+
 /**
  * Clarety Core AI backend (Render-friendly)
  *
- * Supports (backwards + forwards compatible):
- * - JSON chat requests:
- *    { query, sessionId, imageDataUrl }  // imageDataUrl = "data:image/...;base64,..."
- * - multipart/form-data:
- *    fields: query, sessionId
- *    file:   image   (multipart file upload)
- *
- * Features:
- * - Discovery Engine retrieval (RAG) for Clarety/how-to + for tone/terminology on writing requests
- * - Gemini via Vertex AI OpenAI-compatible chat/completions endpoint
+ * Supports:
+ * - JSON chat requests { query, sessionId }
+ * - Image uploads via multipart/form-data (field: image, plus query/sessionId)
+ * - Discovery Engine retrieval (RAG)
+ * - Gemini generation via Vertex AI OpenAI-compatible chat/completions endpoint
  * - Simple per-session memory (in-memory; resets on deploy)
  *
  * ENV VARS REQUIRED:
@@ -36,9 +32,10 @@ const { GoogleAuth } = require("google-auth-library");
 
 const app = express();
 
-// JSON body (normal requests). Keep this low; images should come via data URL or multipart.
-app.use(express.json({ limit: "2mb" }));
+// JSON for normal requests
+app.use(express.json({ limit: "1mb" }));
 
+// CORS
 app.use(
   cors({
     origin: process.env.ALLOWED_ORIGIN || "*",
@@ -57,10 +54,6 @@ function mustGetEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing required env var: ${name}`);
   return v;
-}
-
-function safeString(v) {
-  return (v || "").toString().trim();
 }
 
 function getServiceAccountObject() {
@@ -91,6 +84,29 @@ async function getAccessToken() {
   return token;
 }
 
+function isGreeting(text) {
+  const t = (text || "").trim().toLowerCase();
+  if (!t) return false;
+  return /^(hi|hello|hey|hiya|yo|good\s(morning|afternoon|evening)|howdy|sup)(\b|!|\.)/.test(t);
+}
+
+function isWritingRequest(text) {
+  const t = (text || "").toLowerCase();
+  return (
+    /(draft|write|rewrite|create|compose|prepare)\b/.test(t) &&
+    /(email|appeal|template|letter|message|subject line|copy|newsletter)\b/.test(t)
+  ) || /(draft an email|write an email|draft me an appeal|write an appeal)/i.test(text || "");
+}
+
+function looksLikeFactualHowTo(text) {
+  const t = (text || "").toLowerCase();
+  return /(how do i|how to|where do i|what is|can i|steps|process|workflow|policy|setup|configure)/.test(t);
+}
+
+function safeString(v) {
+  return (v || "").toString().trim();
+}
+
 function fixGsLink(link) {
   if (!link) return null;
   if (link.startsWith("gs://")) return "https://storage.googleapis.com/" + link.slice(5);
@@ -104,43 +120,6 @@ function base64DataUrlFromFile(file) {
   return `data:${mime};base64,${b64}`;
 }
 
-// Accepts either a data URL, or just raw base64 (we’ll treat as png), or empty.
-function normalizeImageDataUrl(maybeDataUrl) {
-  if (!maybeDataUrl) return null;
-  const s = maybeDataUrl.toString().trim();
-  if (!s) return null;
-
-  // If it already looks like a data URL, keep it.
-  if (s.startsWith("data:image/") && s.includes(";base64,")) return s;
-
-  // If it looks like base64 without header, wrap it (assume png).
-  // (This keeps the server tolerant if the frontend accidentally strips the prefix.)
-  const b64ish = /^[A-Za-z0-9+/=\s]+$/.test(s) && s.length > 100;
-  if (b64ish) return `data:image/png;base64,${s.replace(/\s/g, "")}`;
-
-  return null;
-}
-
-function isGreeting(text) {
-  const t = (text || "").trim().toLowerCase();
-  if (!t) return false;
-  return /^(hi|hello|hey|hiya|yo|good\s(morning|afternoon|evening)|howdy|sup)(\b|!|\.)/.test(t);
-}
-
-function isWritingRequest(text) {
-  const t = (text || "").toLowerCase();
-  return (
-    ((/(draft|write|rewrite|create|compose|prepare)\b/.test(t) &&
-      /(email|appeal|template|letter|message|subject line|copy|newsletter)\b/.test(t)) ||
-      /(draft an email|write an email|draft me an appeal|write an appeal)/i.test(text || ""))
-  );
-}
-
-function looksLikeFactualHowTo(text) {
-  const t = (text || "").toLowerCase();
-  return /(how do i|how to|where do i|what is|can i|steps|process|workflow|policy|setup|configure)/.test(t);
-}
-
 // -------------------- Config --------------------
 const DE_PROJECT_NUMBER = mustGetEnv("DE_PROJECT_NUMBER");
 const DE_LOCATION = mustGetEnv("DE_LOCATION");
@@ -152,11 +131,14 @@ const GEMINI_PROJECT_ID = process.env.GEMINI_PROJECT_ID || "groovy-root-483105-n
 const GEMINI_LOCATION = process.env.GEMINI_LOCATION || "us-central1";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "google/gemini-2.0-flash-001";
 
+// OpenAI-compatible endpoint
 const geminiUrl = `https://aiplatform.googleapis.com/v1/projects/${GEMINI_PROJECT_ID}/locations/${GEMINI_LOCATION}/endpoints/openapi/chat/completions`;
 
 // -------------------- Simple memory (in-memory) --------------------
+// NOTE: This resets when Render restarts/redeploys.
+// If you later want persistent memory, we’ll store this in Redis / Firestore.
 const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
-const MAX_TURNS = 12; // keep some context without ballooning tokens
+const MAX_TURNS = 10; // last 10 messages total (user+assistant)
 const sessionStore = new Map(); // sessionId -> { updatedAt, messages: [] }
 
 function getSession(sessionId) {
@@ -248,41 +230,29 @@ app.get("/debug-search", async (req, res) => {
 
 /**
  * Main chat endpoint
- *
  * Accepts:
- * - JSON: { query, sessionId, imageDataUrl }
+ * - JSON: { query, sessionId }
  * - multipart/form-data: fields query, sessionId, and file "image"
- *
- * IMPORTANT:
- * This is intentionally tolerant so changing index.html won't silently break images again.
  */
 app.post("/chat", upload.single("image"), async (req, res) => {
   try {
+    // For multipart: multer fills req.body + req.file
+    // For JSON: express.json fills req.body
     const sessionId = safeString(req.body.sessionId) || "default";
     const userQuery = safeString(req.body.query);
-
-    // ✅ Backwards compatible:
-    // - If frontend sends base64 data URL in JSON (imageDataUrl), use it.
-    // ✅ Forwards compatible:
-    // - If frontend sends multipart image file, convert to data URL.
-    const bodyImageDataUrl = normalizeImageDataUrl(req.body.imageDataUrl || req.body.image || req.body.image_data_url);
-    const fileImageDataUrl = base64DataUrlFromFile(req.file);
-    const imageDataUrl = bodyImageDataUrl || fileImageDataUrl;
-    const hasImage = !!imageDataUrl;
+    const hasImage = !!req.file;
 
     console.log("=================================");
     console.log("CHAT REQUEST", {
       sessionId,
       hasImage,
       queryLen: userQuery.length,
-      hasBodyImage: !!bodyImageDataUrl,
-      hasFileImage: !!req.file,
-      mime: req.file ? req.file.mimetype : null,
-      size: req.file ? req.file.size : null,
+      mime: hasImage ? req.file.mimetype : null,
+      size: hasImage ? req.file.size : null,
     });
     console.log("=================================");
 
-    // Greeting override (only when no image)
+    // 1) Greeting override (no retrieval) — ONLY when no image
     if (!hasImage && isGreeting(userQuery)) {
       const greeting =
         "Hi 👋 I’m the Clarety Assistant.\n" +
@@ -292,26 +262,34 @@ app.post("/chat", upload.single("image"), async (req, res) => {
       return res.json({ answer: greeting, links: [] });
     }
 
-    if (!hasImage && !userQuery) {
+    // If user uploaded an image but typed nothing, don’t punish them
+    if (hasImage && !userQuery) {
+      // Make it explicit to the model we want image understanding
+      // (and don’t return “Ask me something.”)
+    } else if (!hasImage && !userQuery) {
       return res.json({
         answer: "Type a question — or upload a screenshot and ask what you want me to look at.",
         links: [],
       });
     }
 
-    // Decide intent
+    const token = await getAccessToken();
+
+    // 2) Decide whether to retrieve (RAG)
+    // - For factual/how-to: retrieve
+    // - For writing requests: retrieve if available to learn tone/terminology, but do NOT refuse if empty
     const writing = isWritingRequest(userQuery);
     const factual = looksLikeFactualHowTo(userQuery) && !writing;
 
-    // Retrieval: do NOT retrieve for image questions (usually irrelevant)
-    const shouldRetrieve = !hasImage && !!userQuery;
-
-    // Retrieval results
     let snippets = [];
     let links = [];
     let retrievalCount = 0;
 
-    const token = await getAccessToken();
+    // Only run retrieval when:
+    // - factual question, OR
+    // - writing request (tone/terminology), OR
+    // - userQuery exists and no image (general Clarety question)
+    const shouldRetrieve = !hasImage && (factual || writing || !!userQuery);
 
     if (shouldRetrieve) {
       const searchUrl =
@@ -345,7 +323,7 @@ app.post("/chat", upload.single("image"), async (req, res) => {
         if (ea) snippets.push(`- ${d.title || "Source"}: ${ea}`);
       }
 
-      // dedupe links
+      // Dedupe links (title+url)
       const seen = new Set();
       links = links.filter((x) => {
         const k = `${x.title}::${x.url}`;
@@ -353,30 +331,39 @@ app.post("/chat", upload.single("image"), async (req, res) => {
         seen.add(k);
         return true;
       });
+
+      // IMPORTANT:
+      // For writing requests, we do NOT hard-fail if retrieval is empty.
+      // For factual questions, we’ll still help, but we’ll clearly say we didn’t find it.
     }
 
-    // System instructions (prevents the “pressing for more info” loop)
+    // 3) Build system instruction (this is the “brain”)
+    // This is where we stop the “pressing for info” behavior.
     const system = [
       "You are the Clarety Core AI Assistant.",
       "You are helpful, warm, professional, and human.",
       "You are an expert fundraising assistant and copywriter.",
       "",
-      "Rules:",
-      "- If the user asks you to draft/write/rewrite an email/appeal/template: produce a complete draft immediately.",
-      "  Do NOT refuse. Do NOT ask multiple follow-up questions.",
+      "Behavior rules:",
+      "- If user is greeting: respond warmly and briefly (no retrieval talk).",
+      "- If user asks for writing (emails/appeals/templates/rewrites): DO NOT refuse and DO NOT keep asking lots of questions.",
       "  If details are missing, make sensible assumptions and use placeholders like [Organisation Name], [Donation Link], [First Name].",
-      "- If the user asks Clarety how-to/process/policy: use provided snippets when available; if unclear, ask at most ONE clarifying question.",
+      "  Provide a complete draft immediately.",
+      "- If user asks factual Clarety/how-to: use provided snippets when available; if not available, provide best-effort guidance and at most ONE clarifying question.",
+      "- Never say you can't help just because sources are incomplete.",
       "- Do not mention internal systems or that you searched anything.",
       "",
       "If an image is provided:",
-      "- Use the image. Describe what it shows and answer the user's question about it.",
-      "- If unclear, say what’s unclear and what you'd need to see."
+      "- Describe what the image contains and answer the user's question about it.",
+      "- If the image is unclear, say what’s unclear and what you’d need to see."
     ].join("\n");
 
-    // Conversation memory
+    // 4) Build conversation messages (with memory)
+    // Keep last turns to maintain context (like remembering "year-end appeal about giraffes habitat loss")
     const history = getSessionMessages(sessionId);
 
-    // Store user turn (don’t store raw base64)
+    // Add current user turn to memory BEFORE generating
+    // If image-only, store a marker (not raw base64)
     addToSession(sessionId, "user", hasImage ? `[Image uploaded] ${userQuery || ""}`.trim() : userQuery);
 
     const contextBlock =
@@ -384,20 +371,28 @@ app.post("/chat", upload.single("image"), async (req, res) => {
         ? "Helpful reference snippets:\n" + snippets.slice(0, 8).join("\n")
         : "";
 
+    // If drafting + user says "just write it now" / refuses questions, we push that intent
     const nudge =
       writing
         ? "The user wants you to write the draft now without further questions. Make reasonable assumptions and proceed."
         : "";
 
-    const messages = [{ role: "system", content: system }];
+    // OpenAI-compatible message format:
+    // - text-only: { role, content: "..." }
+    // - vision: { role, content: [ {type:"text", text:"..."}, {type:"image_url", image_url:{url:"data:..."} } ] }
+    const messages = [];
 
-    // add prior turns
+    messages.push({ role: "system", content: system });
+
+    // Include memory/history (excluding system)
     for (const m of history) {
       if (m.role === "system") continue;
+      // Keep it compact
       messages.push({ role: m.role, content: m.content });
     }
 
     if (hasImage) {
+      const dataUrl = base64DataUrlFromFile(req.file);
       const userText =
         (userQuery ? `User question: ${userQuery}\n` : "User uploaded an image.\n") +
         (nudge ? `\n${nudge}\n` : "") +
@@ -407,7 +402,7 @@ app.post("/chat", upload.single("image"), async (req, res) => {
         role: "user",
         content: [
           { type: "text", text: userText },
-          { type: "image_url", image_url: { url: imageDataUrl } },
+          { type: "image_url", image_url: { url: dataUrl } },
         ],
       });
     } else {
@@ -422,7 +417,7 @@ app.post("/chat", upload.single("image"), async (req, res) => {
       messages.push({ role: "user", content: userText });
     }
 
-    // Call Gemini
+    // 5) Call Gemini (OpenAI-compatible)
     const genBody = {
       model: GEMINI_MODEL,
       messages,
@@ -449,13 +444,20 @@ app.post("/chat", upload.single("image"), async (req, res) => {
       genJson?.choices?.[0]?.message?.content ||
       "I found information, but couldn't generate a response.";
 
+    // Store assistant response in session memory
     addToSession(sessionId, "assistant", answer);
 
-    // If you later want to show links, return `links` instead of []
+    // IMPORTANT: you wanted links hidden — so always return empty links for now.
+    // (You can bring them back later behind a toggle.)
     return res.json({
       answer,
       links: [],
-      meta: { hasImage, retrievalCount, writing, factual },
+      meta: {
+        hasImage,
+        retrievalCount,
+        writing,
+        factual,
+      },
     });
   } catch (err) {
     console.error("CHAT ERROR:", err.message);

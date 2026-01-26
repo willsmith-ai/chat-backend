@@ -1,16 +1,11 @@
 /**
- * Clarety Core AI backend (Render-friendly)
+ * Clarety Core AI backend (Render-friendly) + Image Uploads
  *
- * What this version fixes:
- * ✅ “Draft an email…” always produces a draft (no interrogations)
- * ✅ Remembers the user is drafting (so “habitat loss” updates the draft)
- * ✅ Greetings/smalltalk don’t trigger RAG or topic dumps
- * ✅ Clarety “how do I…” still uses Discovery Engine grounding
- * ✅ If RAG finds nothing, it falls back to a helpful generative answer (no “No documents found”)
- * ✅ Links are hidden by default (frontend can opt-in later)
- *
- * Optional (recommended) frontend addition:
- * - send a stable sessionId in req.body.sessionId so memory is per user/device.
+ * Adds:
+ * ✅ /chat supports image uploads (multipart/form-data) OR base64 via JSON
+ * ✅ Gemini multimodal via OpenAI-compatible chat/completions: content = [text, image_url]
+ * ✅ Drafting memory: short follow-ups modify prior draft (no interrogation)
+ * ✅ RAG for Clarety how-to; fallback to generative if retrieval is weak
  *
  * ENV VARS REQUIRED:
  *   GOOGLE_JSON_KEY
@@ -31,10 +26,13 @@
 
 const express = require("express");
 const cors = require("cors");
+const multer = require("multer");
 const { GoogleAuth } = require("google-auth-library");
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+
+// JSON for non-multipart requests
+app.use(express.json({ limit: "2mb" }));
 
 app.use(
   cors({
@@ -49,6 +47,14 @@ const fetchFn =
     const mod = await import("node-fetch");
     return mod.default(...args);
   });
+
+// -------------------- Multer (in-memory upload) --------------------
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 6 * 1024 * 1024, // 6MB
+  },
+});
 
 // -------------------- Helpers --------------------
 function mustGetEnv(name) {
@@ -94,6 +100,14 @@ async function getAccessToken() {
   return token;
 }
 
+function nowMs() {
+  return Date.now();
+}
+
+function normalize(text) {
+  return (text || "").toString().trim();
+}
+
 // -------------------- Config --------------------
 const DE_PROJECT_NUMBER = mustGetEnv("DE_PROJECT_NUMBER");
 const DE_LOCATION = mustGetEnv("DE_LOCATION");
@@ -109,47 +123,33 @@ const MEMORY_TTL_MINUTES = Number(process.env.MEMORY_TTL_MINUTES || 60);
 const MEMORY_MAX_TURNS = Number(process.env.MEMORY_MAX_TURNS || 12);
 
 // -------------------- Lightweight session memory (in-process) --------------------
-/**
- * NOTE:
- * - This is per Render instance (ephemeral). Good enough for now.
- * - If Render restarts, memory resets.
- * - For more durable memory, you’d store per-session history in Redis/DB.
- */
 const sessions = new Map();
 
-function nowMs() {
-  return Date.now();
-}
+function getSessionKeyFrom(req, sessionIdMaybe) {
+  if (sessionIdMaybe) return String(sessionIdMaybe);
 
-function getSessionKey(req) {
-  // Best: frontend sends sessionId (stable per browser/device)
-  const sid = (req.body && req.body.sessionId) || req.headers["x-session-id"];
-  if (sid) return String(sid);
+  const sidHeader = req.headers["x-session-id"];
+  if (sidHeader) return String(sidHeader);
 
-  // Fallback: IP + user-agent (not perfect, but works for dev/testing)
   const ua = req.headers["user-agent"] || "ua";
   return `${req.ip}:${ua}`;
 }
 
-function getSession(req) {
-  const key = getSessionKey(req);
+function getOrCreateSession(key) {
   const existing = sessions.get(key);
   const expiry = nowMs() - MEMORY_TTL_MINUTES * 60 * 1000;
 
-  if (existing && existing.updatedAt > expiry) {
-    return { key, session: existing };
-  }
+  if (existing && existing.updatedAt > expiry) return existing;
 
   const fresh = {
     updatedAt: nowMs(),
     mode: "auto", // "auto" | "writing" | "rag"
     history: [], // {role:"user"|"assistant", content:string}
     lastDraft: null, // string
-    lastDraftType: null, // "email"|"appeal"|"template"|etc
+    lastDraftType: null,
   };
-
   sessions.set(key, fresh);
-  return { key, session: fresh };
+  return fresh;
 }
 
 function touchSession(key, session) {
@@ -161,14 +161,13 @@ function addToHistory(session, role, content) {
   if (!content) return;
   session.history.push({ role, content: String(content) });
 
-  // keep last N turns (each turn is user+assistant, so limit by messages)
   const maxMsgs = MEMORY_MAX_TURNS * 2;
   if (session.history.length > maxMsgs) {
     session.history = session.history.slice(session.history.length - maxMsgs);
   }
 }
 
-// Periodic cleanup
+// cleanup
 setInterval(() => {
   const expiry = nowMs() - MEMORY_TTL_MINUTES * 60 * 1000;
   for (const [k, v] of sessions.entries()) {
@@ -177,13 +176,10 @@ setInterval(() => {
 }, 5 * 60 * 1000).unref();
 
 // -------------------- Intent detection --------------------
-function normalize(text) {
-  return (text || "").toString().trim();
-}
-
 function isGreeting(text) {
   const t = normalize(text).toLowerCase();
   if (!t) return false;
+
   if (t.length <= 30) {
     if (
       /^(hi|hello|hey|yo|hiya|howdy|sup|good morning|good afternoon|good evening|thanks|thank you|thx)\b/.test(
@@ -209,14 +205,11 @@ function isWritingRequest(text) {
   const t = normalize(text).toLowerCase();
   if (!t) return false;
 
-  // direct asks
   if (/\b(write|draft|compose|create|generate)\b.*\b(email|appeal|template|newsletter|sms|copy)\b/.test(t))
     return true;
 
-  // rewrite asks
   if (/\b(rewrite|reword|polish|improve|shorten|expand|tidy up)\b/.test(t)) return true;
 
-  // “can you write it for me”
   if (/\bwrite (it|this) (for me|now)\b/.test(t)) return true;
 
   return false;
@@ -229,19 +222,13 @@ function forceWriteNow(text) {
   );
 }
 
-// When user is already drafting, treat short follow-ups as draft modifiers
 function isWritingContinuation(text, session) {
   if (!session || session.mode !== "writing") return false;
   const t = normalize(text);
   if (!t) return false;
-
-  // If it looks like a Clarety how-to question, it’s not drafting continuation
   if (isClaretyHowTo(t)) return false;
 
-  // Short phrases like “habitat loss”, “make it shorter”, “more urgent”, etc.
-  if (t.length <= 120) return true;
-
-  // Also allow “yes / no / ok” while drafting
+  if (t.length <= 200) return true;
   if (/^(yes|yeah|yep|no|nope|ok|okay|sure|do it|go ahead)$/i.test(t)) return true;
 
   return false;
@@ -252,13 +239,16 @@ function inferDraftType(text) {
   if (t.includes("appeal")) return "appeal";
   if (t.includes("newsletter")) return "newsletter";
   if (t.includes("sms")) return "sms";
-  if (t.includes("subject line")) return "email";
-  if (t.includes("email")) return "email";
   if (t.includes("template")) return "template";
   return "email";
 }
 
-// -------------------- Gemini call --------------------
+// -------------------- Gemini call (multimodal) --------------------
+function makeImageDataUrl({ mime, base64 }) {
+  if (!mime || !base64) return null;
+  return `data:${mime};base64,${base64}`;
+}
+
 async function callGemini({ token, system, messages, temperature = 0.4 }) {
   const geminiUrl = `https://aiplatform.googleapis.com/v1/projects/${GEMINI_PROJECT_ID}/locations/${GEMINI_LOCATION}/endpoints/openapi/chat/completions`;
 
@@ -346,7 +336,6 @@ app.get("/debug-search", async (req, res) => {
   try {
     const q = (req.query.q || "").toString();
     const token = await getAccessToken();
-
     const { results, links, snippets, raw } = await searchDiscoveryEngine({ token, query: q });
 
     res.json({
@@ -367,51 +356,65 @@ app.get("/debug-search", async (req, res) => {
 });
 
 /**
- * Main chat endpoint used by your widget frontend
+ * Main chat endpoint (supports multipart and JSON)
  *
- * Request body:
- *   { query: string, sessionId?: string, includeLinks?: boolean }
+ * Multipart:
+ *   fields: query (text), sessionId (optional), includeLinks (optional "true"), image (file)
  *
- * Response:
- *   { answer: string, links: [], mode_used: "gen"|"rag", confidence?: "high"|"low" }
+ * JSON:
+ *   { query, sessionId?, includeLinks?, imageBase64?, imageMime? }
  */
-app.post("/chat", async (req, res) => {
-  const userQuery = normalize(req.body.query);
-  const includeLinks = Boolean(req.body.includeLinks); // default false (hide links)
-  const { key, session } = getSession(req);
+app.post("/chat", upload.single("image"), async (req, res) => {
+  // If multipart, req.body is text fields and req.file is file
+  // If JSON, req.file is undefined and req.body comes from express.json
 
-  if (!userQuery) {
-    return res.json({ answer: "Ask me something.", links: [], mode_used: "gen", confidence: "low" });
+  const query = normalize(req.body?.query);
+  const includeLinks = String(req.body?.includeLinks || "").toLowerCase() === "true";
+  const sessionId = req.body?.sessionId;
+
+  // Image sources:
+  // - multipart file: req.file
+  // - JSON base64: req.body.imageBase64 + req.body.imageMime
+  let imageMime = null;
+  let imageBase64 = null;
+  let imageFilename = null;
+
+  if (req.file && req.file.buffer) {
+    imageMime = req.file.mimetype || "image/png";
+    imageBase64 = req.file.buffer.toString("base64");
+    imageFilename = req.file.originalname || "upload";
+  } else if (req.body?.imageBase64 && req.body?.imageMime) {
+    imageMime = String(req.body.imageMime);
+    imageBase64 = String(req.body.imageBase64);
+    imageFilename = "inline";
   }
+
+  if (!query && !imageBase64) {
+    return res.json({ answer: "Ask me something, or upload an image.", links: [], mode_used: "gen", confidence: "low" });
+  }
+
+  const sessionKey = getSessionKeyFrom(req, sessionId);
+  const session = getOrCreateSession(sessionKey);
 
   try {
     const token = await getAccessToken();
 
-    // ----- Determine intent (with memory) -----
-    const greeting = isGreeting(userQuery);
+    const greeting = query ? isGreeting(query) : false;
+    const claretyHowTo = query ? isClaretyHowTo(query) : false;
 
-    // Writing intent can be:
-    // - explicit writing request now
-    // - forced “write it now”
-    // - continuation of an existing drafting session
     const writingNow =
-      isWritingRequest(userQuery) ||
-      forceWriteNow(userQuery) ||
-      isWritingContinuation(userQuery, session);
+      (query && (isWritingRequest(query) || forceWriteNow(query))) ||
+      (query && isWritingContinuation(query, session)) ||
+      // If user uploads an image and says “rewrite this” etc, it should be writing mode
+      (imageBase64 && query && /\b(rewrite|reword|polish|improve|draft|write|summari[sz]e|extract|turn this into)\b/i.test(query));
 
-    // If the user asks a Clarety how-to, treat as factual even if short
-    const claretyHowTo = isClaretyHowTo(userQuery);
-
-    // Update session mode
+    // mode update
     if (greeting) session.mode = "auto";
     else if (writingNow && !claretyHowTo) session.mode = "writing";
     else if (claretyHowTo) session.mode = "rag";
-    else {
-      // default
-      session.mode = session.mode === "writing" ? "writing" : "auto";
-    }
+    else session.mode = session.mode === "writing" ? "writing" : "auto";
 
-    // ----- Base system prompt -----
+    // Base system prompt
     const baseSystem = [
       "You are the Clarety Core AI Assistant.",
       "You are helpful, warm, professional, and human.",
@@ -422,140 +425,154 @@ app.post("/chat", async (req, res) => {
       "If details are missing, make reasonable assumptions and use placeholders like [Organisation Name].",
     ].join(" ");
 
-    // ----- Build message history for Gemini -----
-    // We give Gemini the last few turns so it remembers context.
-    // (We keep it short to avoid large payloads.)
-    const historyForModel = session.history.slice(-10);
+    // Build a user message that may include an image
+    const imageUrl = imageBase64 ? makeImageDataUrl({ mime: imageMime, base64: imageBase64 }) : null;
 
-    // Always add the current user message at the end
-    const messages = [...historyForModel, { role: "user", content: userQuery }];
+    function makeUserContentWithOptionalImage(text) {
+      if (imageUrl) {
+        return [
+          { type: "text", text: text || "Please analyze the uploaded image and help." },
+          { type: "image_url", image_url: { url: imageUrl } },
+        ];
+      }
+      return text || "";
+    }
 
-    // ----- Route: Greetings / smalltalk -----
+    // greetings (no RAG)
     if (greeting) {
       const system =
         baseSystem +
-        " The user is greeting you or making small talk. Respond warmly and briefly. Do not ask lots of questions. Do not include links.";
+        " The user is greeting you or making small talk. Respond warmly and briefly. Do not include links or lists.";
 
       const answer = await callGemini({
         token,
         system,
-        messages: [{ role: "user", content: userQuery }],
+        messages: [{ role: "user", content: query }],
         temperature: 0.7,
       });
 
-      addToHistory(session, "user", userQuery);
+      addToHistory(session, "user", query);
       addToHistory(session, "assistant", answer || "Hi! How can I help today?");
-      touchSession(key, session);
+      touchSession(sessionKey, session);
 
       return res.json({ answer: answer || "Hi! How can I help today?", links: [], mode_used: "gen", confidence: "high" });
     }
 
-    // ----- Route: Writing / drafting (with memory, no interrogations) -----
+    // writing / drafting (no interrogation)
     if (session.mode === "writing" && !claretyHowTo) {
-      // Infer draft type once and keep it
-      if (!session.lastDraftType) session.lastDraftType = inferDraftType(userQuery);
+      if (!session.lastDraftType && query) session.lastDraftType = inferDraftType(query);
 
       const writingSystem =
         baseSystem +
         " The user wants you to draft or rewrite content." +
         " IMPORTANT: You MUST produce a complete draft immediately." +
         " DO NOT ask follow-up or clarifying questions unless the user explicitly asks you to." +
-        " If the user provides extra details (e.g., 'habitat loss' or 'make it shorter'), incorporate them into the draft." +
-        " Provide a subject line if it's an email or appeal." +
+        " If the user provides extra details, incorporate them into the draft." +
+        " If an image is provided, read it and use its content." +
+        " Provide a subject line if it's an email/appeal." +
         " Output the draft directly, cleanly formatted.";
 
-      // If we have a previous draft, include it as context so “habitat loss” edits it instead of resetting.
       const draftContext = session.lastDraft
-        ? `\n\nPREVIOUS DRAFT (revise this):\n${session.lastDraft}\n\nUSER UPDATE (apply this):\n${userQuery}\n`
-        : `\n\nUSER REQUEST:\n${userQuery}\n`;
+        ? `PREVIOUS DRAFT (revise this):\n${session.lastDraft}\n\nUSER UPDATE (apply this):\n${query || "(See uploaded image)"}`
+        : `USER REQUEST:\n${query || "(See uploaded image)"}\n\nWrite a complete draft now.`;
 
       const answer = await callGemini({
         token,
         system: writingSystem,
-        messages: [{ role: "user", content: draftContext }],
+        messages: [
+          {
+            role: "user",
+            content: makeUserContentWithOptionalImage(draftContext),
+          },
+        ],
         temperature: 0.75,
       });
 
-      // Save memory
-      addToHistory(session, "user", userQuery);
+      // store memory (don’t store base64)
+      if (query) addToHistory(session, "user", query);
+      else addToHistory(session, "user", `[image uploaded: ${imageFilename || "image"}]`);
       addToHistory(session, "assistant", answer);
-      // Keep last draft for revisions (truncate to avoid runaway size)
+
       session.lastDraft = (answer || "").slice(0, 9000);
-      touchSession(key, session);
+      touchSession(sessionKey, session);
 
       return res.json({ answer: answer || "Sure — what would you like the draft to say?", links: [], mode_used: "gen", confidence: "high" });
     }
 
-    // ----- Route: Clarety factual/process (RAG first, fall back to gen) -----
-    // If user explicitly asks how-to, or session is in rag mode, do RAG.
-    const shouldRag = claretyHowTo || session.mode === "rag";
-
-    if (shouldRag) {
-      const { snippets, links } = await searchDiscoveryEngine({ token, query: userQuery });
-      const hasContext = snippets.length > 0;
+    // Clarety how-to / factual (RAG first; still helpful if empty)
+    if (claretyHowTo || session.mode === "rag") {
+      const { snippets, links } = query ? await searchDiscoveryEngine({ token, query }) : { snippets: [], links: [] };
+      const hasContext = (snippets || []).length > 0;
 
       const ragSystem =
         baseSystem +
         " The user asked a Clarety factual/process question." +
         " Use the provided reference context if it is relevant." +
         " If the context is incomplete, still provide a best-effort helpful answer." +
-        " If you need one missing detail, ask at most ONE clarifying question." +
+        " Ask at most ONE clarifying question only if absolutely necessary." +
+        " If an image is provided, use it as additional context." +
         " Do not refuse.";
 
       const genSystem =
         baseSystem +
-        " The user asked a Clarety question but you do not have strong reference context." +
-        " Still answer as helpfully as possible, and ask at most ONE clarifying question if needed." +
+        " The user asked a question but you do not have strong reference context." +
+        " Still answer as helpfully as possible and ask at most ONE clarifying question if needed." +
+        " If an image is provided, use it as context." +
         " Do not refuse.";
 
       const contextBlock = hasContext
         ? "REFERENCE CONTEXT (may be partial):\n" + snippets.slice(0, 8).join("\n")
         : "";
 
-      const userPayload = hasContext
-        ? `User question:\n${userQuery}\n\n${contextBlock}`
-        : userQuery;
+      const payload = hasContext
+        ? `User question:\n${query}\n\n${contextBlock}`
+        : (query || "Please analyze the uploaded image and help.");
 
       const answer = await callGemini({
         token,
         system: hasContext ? ragSystem : genSystem,
-        messages: [{ role: "user", content: userPayload }],
-        temperature: hasContext ? 0.2 : 0.5,
+        messages: [{ role: "user", content: makeUserContentWithOptionalImage(payload) }],
+        temperature: hasContext ? 0.2 : 0.55,
       });
 
-      addToHistory(session, "user", userQuery);
+      if (query) addToHistory(session, "user", query);
+      else addToHistory(session, "user", `[image uploaded: ${imageFilename || "image"}]`);
       addToHistory(session, "assistant", answer);
-      // If they switch to Clarety Qs, clear drafting state
+
+      // clear drafting state when in RAG mode
       session.lastDraft = null;
       session.lastDraftType = null;
-      touchSession(key, session);
+
+      touchSession(sessionKey, session);
 
       return res.json({
-        answer: answer || "I can help with that — what part are you trying to do in Clarety?",
+        answer: answer || "I can help — what are you trying to do in Clarety?",
         links: includeLinks && hasContext ? links : [],
         mode_used: hasContext ? "rag" : "gen",
         confidence: hasContext ? "high" : "low",
       });
     }
 
-    // ----- Route: General discussion (no RAG by default, but helpful) -----
+    // General discussion (no RAG by default)
     const generalSystem =
       baseSystem +
       " The user is describing a situation or asking a general question." +
       " Respond helpfully and practically." +
-      " Ask at most ONE clarifying question only if absolutely needed to proceed." +
+      " Ask at most ONE clarifying question only if absolutely needed." +
+      " If an image is provided, analyze it." +
       " Do not refuse.";
 
     const answer = await callGemini({
       token,
       system: generalSystem,
-      messages,
-      temperature: 0.6,
+      messages: [{ role: "user", content: makeUserContentWithOptionalImage(query || "Please analyze the uploaded image and help.") }],
+      temperature: 0.65,
     });
 
-    addToHistory(session, "user", userQuery);
+    if (query) addToHistory(session, "user", query);
+    else addToHistory(session, "user", `[image uploaded: ${imageFilename || "image"}]`);
     addToHistory(session, "assistant", answer);
-    touchSession(key, session);
+    touchSession(sessionKey, session);
 
     return res.json({ answer: answer || "Tell me a bit more and I’ll help.", links: [], mode_used: "gen", confidence: "low" });
   } catch (err) {
